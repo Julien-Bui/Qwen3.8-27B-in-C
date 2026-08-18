@@ -380,9 +380,37 @@ void l2norm(float *out, const float *x, uint64_t n, float eps) {
     }
 }
 
+static inline __m256 exp256_ps(__m256 x) {
+    __m256 x_clamp = _mm256_max_ps(_mm256_min_ps(x, _mm256_set1_ps(88.0f)), _mm256_set1_ps(-88.0f));
+    __m256 k = _mm256_round_ps(_mm256_mul_ps(x_clamp, _mm256_set1_ps(1.4426950408889634f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(k, _mm256_set1_ps(0.6931471805599453f), x_clamp);
+    __m256 p = _mm256_set1_ps(0.000198412698f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.00139304842f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.00833333333f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.04166666666f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.16666666666f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    __m256i ik = _mm256_cvtps_epi32(k);
+    __m256i pow2 = _mm256_slli_epi32(_mm256_add_epi32(ik, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(pow2));
+}
+
 /* silu(x) = x * sigmoid(x) = x / (1 + exp(-x)) */
 void silu_inplace(float *x, uint64_t n) {
-    for (uint64_t i = 0; i < n; i++) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 negx = _mm256_sub_ps(zero, vx);
+        __m256 exp_negx = exp256_ps(negx);
+        __m256 denom = _mm256_add_ps(one, exp_negx);
+        __m256 sig = _mm256_div_ps(one, denom);
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(vx, sig));
+    }
+    for (; i < n; i++) {
         float val = x[i];
         if (val < -20.0f) {
             x[i] = val * expf(val);
@@ -396,7 +424,17 @@ void silu_inplace(float *x, uint64_t n) {
 
 /* sigmoid(x) = 1 / (1 + exp(-x)) */
 void sigmoid_inplace(float *x, uint64_t n) {
-    for (uint64_t i = 0; i < n; i++) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 negx = _mm256_sub_ps(zero, vx);
+        __m256 exp_negx = exp256_ps(negx);
+        __m256 denom = _mm256_add_ps(one, exp_negx);
+        _mm256_storeu_ps(x + i, _mm256_div_ps(one, denom));
+    }
+    for (; i < n; i++) {
         float val = x[i];
         if (val < -20.0f) {
             x[i] = 0.0f;
