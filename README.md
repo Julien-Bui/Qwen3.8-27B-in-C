@@ -39,6 +39,7 @@ This project provides an end-to-end local LLM inference stack designed to run th
 ## Key Technical Features
 
 ### Pure C11 Inference Core
+
 - **Zero External C Libraries**: 100% standard C11 relying only on `libc`, `libm`, and POSIX `pthread`.
 - **64-Layer Hybrid Backbone Architecture**:
   - **48 Gated DeltaNet Layers**: State-Space Model (SSM) featuring causal linear recurrence $S_h \in \mathbb{R}^{128 \times 128}$, 4-step causal Conv1D, per-head exponential decay, and L2Norm.
@@ -57,6 +58,7 @@ This project provides an end-to-end local LLM inference stack designed to run th
   - Top-K candidate extraction in $O(V \log K)$ using a fixed stack-allocated min-heap (0.36 ms vs 30 ms previously), Nucleus Top-P, Temperature scaling, Repetition Penalty, and XorShift64 PRNG.
 
 ### Python Streaming Backend & Web UI
+
 - **Zero-Dependency Python Backend (`server.py`)**: Uses only the Python 3 standard library (`http.server`, `subprocess`, `threading`, `json`, `urllib.parse`). No `pip install` required.
 - **Real-Time Token Streaming**: Streams tokens from the C binary directly to the browser using Server-Sent Events (`text/event-stream`).
 - **Process Lifecycle Management**: Thread-safe subprocess handling with immediate cancellation support via `/api/stop`.
@@ -109,51 +111,60 @@ This project provides an end-to-end local LLM inference stack designed to run th
 ## Build & Usage Guide
 
 ### 1. Prerequisites
+
 - **C Compiler**: GCC (with C11 support)
 - **CPU**: x86-64 CPU supporting **AVX2** and **FMA** (Intel Haswell+ or AMD Zen2+)
 - **Python**: Python 3.8+ (Standard library only, no packages to install)
 - **Model**: `Qwen3.8-27B-IQ4_XS.gguf` placed at the project root
 
 ### 2. Compilation
+
 ```bash
 make -j8
 ```
 
 ### 3. Running the Web Interface (Recommended)
+
 ```bash
 make serve
 ```
+
 or directly with Python:
+
 ```bash
 python3 server.py --port 8080
 ```
+
 Then open **`http://localhost:8080`** in your browser.
 
 ### 4. Running Text Generation from CLI
 
 **Fast Speculative Decoding Mode (Recommended):**
+
 ```bash
 ./build/qwen -m Qwen3.8-27B-IQ4_XS.gguf -p "Hello! Introduce yourself in one sentence:" -n 32 --threads 12 --spec 1 --temp 0
 ```
 
 **Standard Sampling Mode:**
+
 ```bash
 ./build/qwen -m Qwen3.8-27B-IQ4_XS.gguf -p "Write a C function to reverse a string:" -n 48 --threads 12 --temp 0.7
 ```
 
 ### 5. CLI Arguments Reference
-| Argument | Description | Default |
-|---|---|---|
-| `-m, --model` | Path to GGUF model file | `Qwen3.8-27B-IQ4_XS.gguf` |
-| `-p, --prompt` | Input prompt text | `"Hello! Introduce yourself in one sentence:"` |
-| `-n, --n-predict` | Number of tokens to generate | `32` |
-| `-t, --threads` | Number of CPU worker threads | `12` |
-| `-c, --ctx-size` | Allocated context length | `512` |
-| `--spec` | MTP speculative drafts count (`0` = off, `1` = on) | `0` |
-| `--temp` | Sampling temperature (`0.0` = greedy) | `0.70` |
-| `--top-p` | Nucleus sampling cutoff (Top-P) | `0.90` |
-| `--top-k` | Top-K candidate pool size | `40` |
-| `--repeat-penalty` | Repetition penalty factor | `1.10` |
+
+| Argument           | Description                                        | Default                                        |
+| ------------------ | -------------------------------------------------- | ---------------------------------------------- |
+| `-m, --model`      | Path to GGUF model file                            | `Qwen3.8-27B-IQ4_XS.gguf`                      |
+| `-p, --prompt`     | Input prompt text                                  | `"Hello! Introduce yourself in one sentence:"` |
+| `-n, --n-predict`  | Number of tokens to generate                       | `32`                                           |
+| `-t, --threads`    | Number of CPU worker threads                       | `12`                                           |
+| `-c, --ctx-size`   | Allocated context length                           | `512`                                          |
+| `--spec`           | MTP speculative drafts count (`0` = off, `1` = on) | `0`                                            |
+| `--temp`           | Sampling temperature (`0.0` = greedy)              | `0.70`                                         |
+| `--top-p`          | Nucleus sampling cutoff (Top-P)                    | `0.90`                                         |
+| `--top-k`          | Top-K candidate pool size                          | `40`                                           |
+| `--repeat-penalty` | Repetition penalty factor                          | `1.10`                                         |
 
 ---
 
@@ -162,9 +173,11 @@ Then open **`http://localhost:8080`** in your browser.
 The Python server (`server.py`) exposes the following endpoints:
 
 ### `POST /api/chat`
+
 Starts a streaming inference session using Server-Sent Events (SSE).
 
 **Request Body (JSON):**
+
 ```json
 {
   "prompt": "Explain AVX2 SIMD in two sentences.",
@@ -179,6 +192,7 @@ Starts a streaming inference session using Server-Sent Events (SSE).
 
 **Response:**
 Stream of Server-Sent Events:
+
 ```
 data: {"type": "token", "content": "AVX2"}
 
@@ -188,19 +202,20 @@ data: {"type": "done"}
 ```
 
 ### `POST /api/stop`
+
 Terminates the active inference process immediately.
 
 ---
 
 ## Test Suite and Verification
 
-| Command | Objective | Result |
-|---|---|---|
-| `./build/test_ops` | Mathematical validation of ops (RMSNorm, L2Norm, SiLU, Softmax) | **37,016 assertions passed (0 failures)** |
-| `./build/test_tokenizer Qwen3.8-27B-IQ4_XS.gguf` | Validation of 248k BPE Tokenizer (French, English, Code, Math) | **100% Match (zero mojibake)** |
-| `./build/test_batch Qwen3.8-27B-IQ4_XS.gguf` | Verification of batched GEMV against single-token GEMV | **Max diff = 0.000e+00** |
-| `./build/test_forward_batch Qwen3.8-27B-IQ4_XS.gguf 3` | Batched forward pass equivalence check | **Max diff = 0.000e+00** |
-| `./build/test_kernels Qwen3.8-27B-IQ4_XS.gguf 12` | AVX2 GEMV memory bandwidth benchmark | **18.55 GB/s sustained throughput** |
+| Command                                                | Objective                                                       | Result                                    |
+| ------------------------------------------------------ | --------------------------------------------------------------- | ----------------------------------------- |
+| `./build/test_ops`                                     | Mathematical validation of ops (RMSNorm, L2Norm, SiLU, Softmax) | **37,016 assertions passed (0 failures)** |
+| `./build/test_tokenizer Qwen3.8-27B-IQ4_XS.gguf`       | Validation of 248k BPE Tokenizer (French, English, Code, Math)  | **100% Match (zero mojibake)**            |
+| `./build/test_batch Qwen3.8-27B-IQ4_XS.gguf`           | Verification of batched GEMV against single-token GEMV          | **Max diff = 0.000e+00**                  |
+| `./build/test_forward_batch Qwen3.8-27B-IQ4_XS.gguf 3` | Batched forward pass equivalence check                          | **Max diff = 0.000e+00**                  |
+| `./build/test_kernels Qwen3.8-27B-IQ4_XS.gguf 12`      | AVX2 GEMV memory bandwidth benchmark                            | **18.55 GB/s sustained throughput**       |
 
 ---
 
@@ -208,13 +223,13 @@ Terminates the active inference process immediately.
 
 Measured on Intel Core i9-12900H (12 threads, DDR5 RAM under WSL2):
 
-| Component | Baseline | Optimized | Speedup |
-|---|---|---|---|
-| **Top-K Sampler** | 30.0 ms (full 248k `qsort`) | **0.36 ms** (Stack Min-Heap) | **80x faster** |
-| **SiLU Activation** | ~10.0 ms (scalar `expf`) | **1.14 ms** (AVX2 `exp256_ps`) | **8.7x faster** |
-| **Prefill Speed** | 0.74 tok/s | **1.25 tok/s** | **+68.9 %** |
-| **Generation (Standard Greedy)** | 1.06 tok/s | **1.23 tok/s** | **+16.0 %** |
-| **Generation (Speculative MTP `--spec 1`)** | 1.06 tok/s | **1.64 tok/s** (80-90% draft acceptance) | **+54.7 %** |
+| Component                                   | Baseline                    | Optimized                                | Speedup         |
+| ------------------------------------------- | --------------------------- | ---------------------------------------- | --------------- |
+| **Top-K Sampler**                           | 30.0 ms (full 248k `qsort`) | **0.36 ms** (Stack Min-Heap)             | **80x faster**  |
+| **SiLU Activation**                         | ~10.0 ms (scalar `expf`)    | **1.14 ms** (AVX2 `exp256_ps`)           | **8.7x faster** |
+| **Prefill Speed**                           | 0.74 tok/s                  | **1.25 tok/s**                           | **+68.9 %**     |
+| **Generation (Standard Greedy)**            | 1.06 tok/s                  | **1.23 tok/s**                           | **+16.0 %**     |
+| **Generation (Speculative MTP `--spec 1`)** | 1.06 tok/s                  | **1.64 tok/s** (80-90% draft acceptance) | **+54.7 %**     |
 
 ---
 
@@ -230,6 +245,20 @@ swap=8GB
 ```
 
 Then restart WSL from Windows PowerShell:
+
 ```powershell
 wsl --shutdown
 ```
+
+---
+
+## Acknowledgements & Credits
+
+- **Inspiration**: This project is strongly inspired by the architecture and engineering principles of **Colibri**, alongside reference design patterns from the **llama.cpp** / **ggml** ecosystem.
+- **AI-Assisted Engineering**: A substantial portion of the code (AVX2 kernels, BPE tokenizer, hybrid layer mechanics, test harnesses, and web stack) was designed and generated through AI pair-programming (Antigravity and OpenCode).
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
