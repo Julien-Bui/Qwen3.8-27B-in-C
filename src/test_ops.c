@@ -96,7 +96,7 @@ static void ref_softmax(double *out, const float *x, uint64_t n) {
 /* ============== Tests specifiques ============== */
 
 static void test_rmsnorm_known(void) {
-    printf("  [+] Test RMSNorm vecteurs connus\n");
+    printf("  [+] Test RMSNorm known vectors\n");
     float x1[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     float w1[4] = { 2.0f, 2.0f, 2.0f, 2.0f };
     float out1[4] = { 0 };
@@ -114,7 +114,7 @@ static void test_rmsnorm_known(void) {
 }
 
 static void test_l2norm_known(void) {
-    printf("  [+] Test L2Norm vecteurs connus\n");
+    printf("  [+] Test L2Norm known vectors\n");
     float x1[2] = { 3.0f, 4.0f };
     float out1[2] = { 0 };
     l2norm(out1, x1, 2, 1e-5f);
@@ -131,7 +131,7 @@ static void test_l2norm_known(void) {
 }
 
 static void test_activations_known(void) {
-    printf("  [+] Test activations valeurs remarquables et debordement\n");
+    printf("  [+] Test activations special values & stability\n");
     /* SiLU */
     float x_silu[4] = { 0.0f, 2.0f, -20.0f, 20.0f };
     silu_inplace(x_silu, 4);
@@ -169,7 +169,7 @@ static void test_activations_known(void) {
 }
 
 static void test_random_dimensions(void) {
-    printf("  [+] Test comparatif multi-dimensions (AVX2 et scalaire vs Double)\n");
+    printf("  [+] Comparative multi-dimension benchmark (AVX2 & Scalar vs FP64)\n");
     const uint64_t dims[] = { 1, 3, 7, 8, 15, 16, 32, 64, 128, 256, 512, 5120 };
     const size_t n_dims = sizeof dims / sizeof dims[0];
 
@@ -240,15 +240,15 @@ static void test_random_dimensions(void) {
 }
 
 int main(void) {
-    printf(ANSI_BOLD "=== Module D1 : Test des Ops Scalaires et Vectorisees ===" ANSI_RESET "\n\n");
+    printf(ANSI_BOLD "=== Module D1: Scalar and Vectorized Ops Test Suite ===" ANSI_RESET "\n\n");
     test_rmsnorm_known();
     test_l2norm_known();
     test_activations_known();
     test_random_dimensions();
 
-    printf("\nTotal assertions: %d, Echecs: %d\n", g_tests, g_fails);
+    printf("\nTotal assertions: %d, Failures: %d\n", g_tests, g_fails);
     if (g_fails == 0) {
-        printf(ANSI_GREEN ANSI_BOLD "TOUS LES TESTS D1 ONT REUSSI (SUCCES)\n" ANSI_RESET);
+        printf(ANSI_GREEN ANSI_BOLD "ALL D1 TESTS PASSED SUCCESSFULLY\n" ANSI_RESET);
         return 0;
     } else {
         printf(ANSI_RED ANSI_BOLD "%d ECHEC(S) DETECTE(S)\n" ANSI_RESET, g_fails);

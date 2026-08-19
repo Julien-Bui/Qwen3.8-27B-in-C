@@ -1,10 +1,10 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O3 -std=c11 -Iinclude -march=native -mavx2 -mfma
+CFLAGS  = -Wall -Wextra -O3 -std=c11 -Iinclude -march=native -mavx2 -mfma -DQWEN_PROFILE
 LDLIBS  = -lm -lpthread
 
 SRCS_COMMON = src/gguf.c src/quant.c src/kernels.c src/threadpool.c src/model.c src/tokenizer.c src/sampler.c
 
-all: build/qwen build/test_tokenizer build/test_forward build/test_ops build/test_kernels build/test_quant build/test_model
+all: build/qwen build/test_tokenizer build/test_forward build/test_ops build/test_kernels build/test_quant build/test_model build/test_batch build/test_forward_batch
 
 build:
 	mkdir -p build
@@ -29,6 +29,12 @@ build/test_ops: src/test_ops.c src/kernels.c src/quant.c src/threadpool.c | buil
 
 build/test_quant: src/test_quant.c src/gguf.c src/quant.c | build
 	$(CC) $(CFLAGS) src/test_quant.c src/gguf.c src/quant.c -o $@ $(LDLIBS)
+
+build/test_batch: src/test_batch.c $(SRCS_COMMON) | build
+	$(CC) $(CFLAGS) src/test_batch.c $(SRCS_COMMON) -o $@ $(LDLIBS)
+
+build/test_forward_batch: src/test_forward_batch.c $(SRCS_COMMON) | build
+	$(CC) $(CFLAGS) src/test_forward_batch.c $(SRCS_COMMON) -o $@ $(LDLIBS)
 
 clean:
 	rm -rf build
