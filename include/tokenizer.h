@@ -34,7 +34,6 @@ typedef struct {
     uint32_t pad_id;
 
     char byte_to_str[256][8];
-    /* inverse byte-level : cp unicode -> octet brut (0xFF = non mappé) */
     uint8_t cp_to_byte[0x160];
 } tokenizer_t;
 

@@ -205,6 +205,10 @@ int gguf_open(gguf_context_t *ctx, const char *filepath) {
         perror("mmap");
         goto fail;
     }
+#ifdef MADV_RANDOM
+    /* Random weight access: disable kernel aggressive readahead */
+    madvise((void *)ctx->mmap_data, ctx->file_size, MADV_RANDOM);
+#endif
 
     const uint8_t *p   = ctx->mmap_data;
     const uint8_t *end = p + ctx->file_size;

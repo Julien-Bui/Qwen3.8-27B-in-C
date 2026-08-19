@@ -25,8 +25,7 @@ typedef enum {
     GGUF_TYPE_FLOAT64 = 12,
 } gguf_type_t;
 
-/* Ne jamais déréférencer un pointeur sur un champ de cette struct :
- * unpacked => accès non alignés possibles. Lecture via memcpy uniquement. */
+/* Packed GGUF header (read via memcpy to avoid unaligned access) */
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -34,8 +33,7 @@ typedef struct {
     uint64_t metadata_kv_count;
 } __attribute__((packed)) gguf_header_t;
 
-/* Type d'un TENSEUR (format de quantification ggml_type).
- * Valeurs vérifiées par arithmétique d'offsets sur le fichier réel. */
+/* Tensor quantization format type (matching GGML type indices) */
 typedef enum {
     GGML_F32     = 0,
     GGML_F16     = 1,
@@ -63,12 +61,12 @@ typedef enum {
 } ggml_type_t;
 
 typedef struct {
-    char         name[GGUF_MAX_NAME]; /* tronqué à GGUF_MAX_NAME-1 caractères */
+    char         name[GGUF_MAX_NAME]; /* Tensor name */
     uint32_t     n_dims;
-    uint64_t     ne[4];               /* ne[0] = dim la plus interne (contiguë) */
-    ggml_type_t  type;                /* format de quantification des poids */
-    uint64_t     offset;              /* relatif à data_base, déjà aligné */
-    const void  *data;                /* = data_base + offset, mappé PROT_READ */
+    uint64_t     ne[4];               /* ne[0] = innermost contiguous dimension */
+    ggml_type_t  type;                /* Weight quantization format */
+    uint64_t     offset;              /* Relative to data_base, aligned */
+    const void  *data;                /* = data_base + offset, mapped PROT_READ */
 } gguf_tensor_info_t;
 
 typedef struct {
@@ -85,42 +83,38 @@ typedef struct {
     uint32_t rope_sections[4];  /* rope.dimension_sections (mrope) */
     float    rms_norm_eps;
     bool     tie_word_embeddings;
-    /* Architecture hybride (couches SSM + pleine attention entrelacées) */
-    uint32_t full_attn_interval; /* 0 si pur transformeur */
+    /* Hybrid architecture (interleaved SSM and full attention layers) */
+    uint32_t full_attn_interval;
     uint32_t ssm_state_size;
     uint32_t ssm_conv_kernel;
     uint32_t ssm_inner_size;
     uint32_t ssm_group_count;
-    uint32_t nextn_layers;       /* couches MTP (prédiction multi-token) */
+    uint32_t nextn_layers;       /* MTP layers (multi-token prediction) */
 } qwen_config_t;
 
 typedef struct {
-    int                 fd;           /* -1 si fermé */
+    int                 fd;
     size_t              file_size;
-    const void         *mmap_data;    /* mapping du fichier entier, PROT_READ */
-    const void         *data_base;    /* début de la section de données */
-    uint32_t            alignment;    /* propriété du fichier GGUF, pas du modèle */
-    char                arch[32];     /* valeur de general.architecture ("qwen3") */
+    const void         *mmap_data;    /* Whole file mmap, PROT_READ */
+    const void         *data_base;    /* Start of tensor binary data */
+    uint32_t            alignment;
+    char                arch[32];     /* general.architecture ("qwen3") */
     gguf_header_t       header;
-    qwen_config_t       config;       /* champs à 0 si clé absente */
-    gguf_tensor_info_t *tensors;      /* tensor_count entrées */
+    qwen_config_t       config;
+    gguf_tensor_info_t *tensors;      /* tensor_count entries */
     uint64_t            tensor_count;
 } gguf_context_t;
 
-/* gguf_open : retourne 0 en cas de succès, -1 en cas d'échec.
- * En cas d'échec : toutes les ressources sont libérées, ctx remis à zéro
- * (fd = -1), gguf_close(ctx) reste appelable sans danger.
- * En cas de succès : les pointeurs du ctx et tensors[].data sont valides
- * jusqu'à gguf_close(). */
+/* Opens and parses GGUF file. Returns 0 on success, -1 on failure. */
 int  gguf_open(gguf_context_t *ctx, const char *filepath);
 
-/* gguf_close : libère mapping + tensors[]. Appelable sur un ctx zéro. */
+/* Closes file and unmaps memory. */
 void gguf_close(gguf_context_t *ctx);
 
-/* Taille en octets d'une valeur du type donné (0 si taille variable). */
+/* Returns byte size of a GGUF metadata type (0 if variable). */
 size_t gguf_type_size(gguf_type_t t);
 
-/* Recherche par nom exact. Retourne NULL si absent. */
+/* Finds tensor by exact name. Returns NULL if absent. */
 const gguf_tensor_info_t *gguf_find_tensor(const gguf_context_t *ctx, const char *name);
 
-#endif
+#endif /* GGUF_H */
