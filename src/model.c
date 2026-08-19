@@ -78,6 +78,8 @@ int model_init(qwen_model_t *m, const char *path, uint32_t n_ctx) {
     d->conv_dim = 2 * d->n_k_heads * d->head_k_dim + d->d_inner;
     d->n_layer = (c->n_layer > c->nextn_layers) ? c->n_layer - c->nextn_layers : c->n_layer;
     if (d->d_inner != d->n_v_heads * d->head_v_dim) goto fail;
+    /* bornes des buffers de tete du forward (beta/alpha, delta/d_vec) */
+    if (d->n_v_heads > 256 || d->head_v_dim > 256 || d->head_k_dim > 256) goto fail;
 
     m->tok_embd = must_find(&m->gguf, "token_embd.weight");
     m->output_norm = must_find(&m->gguf, "output_norm.weight");
@@ -202,24 +204,25 @@ void model_free(qwen_model_t *m) {
     memset(m, 0, sizeof *m);
 }
 
-static void apply_rope(float *vec, uint32_t pos, float theta,
-                       const uint32_t *sections, uint32_t rope_dims) {
-    uint32_t pair_offset = 0;
-    for (int s = 0; s < 3; s++) {
-        uint32_t sec_len = sections[s];
-        for (uint32_t j = 0; j < sec_len; j++) {
-            float freq = powf(theta, -2.0f * (float)j / (float)rope_dims);
-            float angle = (float)pos * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
-            uint32_t idx0 = (pair_offset + j) * 2;
-            uint32_t idx1 = idx0 + 1;
-            float v0 = vec[idx0];
-            float v1 = vec[idx1];
-            vec[idx0] = v0 * cos_a - v1 * sin_a;
-            vec[idx1] = v0 * sin_a + v1 * cos_a;
-        }
-        pair_offset += sec_len;
+/* RoPE "IMROPE" (qwen35) en mode texte : les 4 ids de position mrope sont
+ * egaux, donc les sections {11,11,10,0} n'ont AUCUN effet (elles ne font que
+ * selectionner l'id de position, ggml-cpu/ops.cpp ggml_mrope_cache_init).
+ * Reste un RoPE NeoX PARTIEL, verifie sur le kernel ggml :
+ *   - paires en demi-blocs : (i, i + rope_dims/2) sur les rope_dims premieres
+ *     dims de la tete (rotate_pairs(n_dims, n_dims/2), PAS adjacentes)
+ *   - index de frequence CONTINU 0..rope_dims/2-1 (pas de redemarrage) :
+ *     angle_i = pos * theta^(-2i/rope_dims) */
+static void apply_rope(float *vec, uint32_t pos, float theta, uint32_t rope_dims) {
+    const uint32_t half = rope_dims / 2;
+    for (uint32_t i = 0; i < half; i++) {
+        float freq = powf(theta, -2.0f * (float)i / (float)rope_dims);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        float v0 = vec[i];
+        float v1 = vec[i + half];
+        vec[i] = v0 * cos_a - v1 * sin_a;
+        vec[i + half] = v0 * sin_a + v1 * cos_a;
     }
 }
 
@@ -255,11 +258,11 @@ void attention_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t po
 
     for (uint32_t h = 0; h < n_head; h++) {
         float *qh = m->qkv + h * (2 * head_dim);
-        apply_rope(qh, pos, m->cfg.rope_theta, d->rope_sections, m->cfg.rope_dim_count);
+        apply_rope(qh, pos, m->cfg.rope_theta, m->cfg.rope_dim_count);
     }
     for (uint32_t kh = 0; kh < n_kv_head; kh++) {
         float *kh_ptr = k_cache_pos + kh * head_dim;
-        apply_rope(kh_ptr, pos, m->cfg.rope_theta, d->rope_sections, m->cfg.rope_dim_count);
+        apply_rope(kh_ptr, pos, m->cfg.rope_theta, m->cfg.rope_dim_count);
     }
 
     const float scale_attn = 1.0f / sqrtf((float)head_dim);
@@ -358,8 +361,7 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
 
     gemv(pool, L->wqkv_gate, m->xb, m->z);
 
-    float beta[256], alpha[256];   /* bornés par n_v_heads (48 ici) */
-    if (n_v_heads > 256) return;
+    float beta[256], alpha[256];   /* bornes validees a l'init */
     gemv(pool, L->ssm_beta, m->xb, beta);
     gemv(pool, L->ssm_alpha, m->xb, alpha);
 
@@ -379,38 +381,40 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
         float a_sp = (alpha[h] + dt_bias[h] > 30.0f) ? (alpha[h] + dt_bias[h]) : log1pf(expf(alpha[h] + dt_bias[h]));
         float decay = expf(ssm_a[h] * a_sp);
 
-        __m256 vdecay = _mm256_set1_ps(decay);
-        for (uint32_t i = 0; i < head_v_dim * head_k_dim; i += 8) {
-            _mm256_storeu_ps(S + i, _mm256_mul_ps(_mm256_loadu_ps(S + i), vdecay));
+        /* k.q : constant par tete (pour la sortie algebrique) */
+        __m256 kq_acc = _mm256_setzero_ps();
+        for (uint32_t i = 0; i < head_k_dim; i += 8) {
+            kq_acc = _mm256_fmadd_ps(_mm256_loadu_ps(k_vec + i), _mm256_loadu_ps(qh + i), kq_acc);
         }
+        const float kq = hsum256(kq_acc);
 
-        float delta[256], d_vec[256];   /* bornés par head_v_dim (128 ici) */
+        /* Fusion exacte des 4 balayages de S en 2 passes par ligne :
+         *   delta_j = decay * (S_j . k)
+         *   d_j     = (v_j - delta_j) * beta
+         *   S'_j    = decay * S_j + k * d_j
+         *   o_j     = decay * (S_j . q) + d_j * (k . q)
+         * Passe 1 : les deux dots par ligne ; passe 2 : ecriture de S'. */
         for (uint32_t j = 0; j < head_k_dim; j++) {
-            __m256 acc = _mm256_setzero_ps();
+            const float *row = S + (size_t)j * head_v_dim;
+            __m256 acc_k = _mm256_setzero_ps();
+            __m256 acc_q = _mm256_setzero_ps();
             for (uint32_t i = 0; i < head_v_dim; i += 8) {
-                acc = _mm256_fmadd_ps(_mm256_loadu_ps(S + j * head_v_dim + i), _mm256_loadu_ps(k_vec + i), acc);
+                __m256 srow = _mm256_loadu_ps(row + i);
+                acc_k = _mm256_fmadd_ps(srow, _mm256_loadu_ps(k_vec + i), acc_k);
+                acc_q = _mm256_fmadd_ps(srow, _mm256_loadu_ps(qh + i), acc_q);
             }
-            delta[j] = hsum256(acc);
-        }
+            float delta = decay * hsum256(acc_k);
+            float d_j = (v_vec[j] - delta) * b_val;
+            out_h[j] = (decay * hsum256(acc_q) + d_j * kq) * q_scale;
 
-        for (uint32_t j = 0; j < head_v_dim; j++) {
-            d_vec[j] = (v_vec[j] - delta[j]) * b_val;
-        }
-
-        for (uint32_t j = 0; j < head_k_dim; j++) {
-            __m256 vd = _mm256_set1_ps(d_vec[j]);
-            float *S_row = S + j * head_v_dim;
+            float *row_w = S + (size_t)j * head_v_dim;
+            __m256 vdj = _mm256_set1_ps(d_j);
+            __m256 vdec = _mm256_set1_ps(decay);
             for (uint32_t i = 0; i < head_v_dim; i += 8) {
-                _mm256_storeu_ps(S_row + i, _mm256_fmadd_ps(_mm256_loadu_ps(k_vec + i), vd, _mm256_loadu_ps(S_row + i)));
+                __m256 srow = _mm256_loadu_ps(row_w + i);
+                srow = _mm256_fmadd_ps(vdj, _mm256_loadu_ps(k_vec + i), _mm256_mul_ps(vdec, srow));
+                _mm256_storeu_ps(row_w + i, srow);
             }
-        }
-
-        for (uint32_t j = 0; j < head_v_dim; j++) {
-            __m256 acc = _mm256_setzero_ps();
-            for (uint32_t i = 0; i < head_k_dim; i += 8) {
-                acc = _mm256_fmadd_ps(_mm256_loadu_ps(S + j * head_v_dim + i), _mm256_loadu_ps(qh + i), acc);
-            }
-            out_h[j] = hsum256(acc) * q_scale;
         }
     }
 

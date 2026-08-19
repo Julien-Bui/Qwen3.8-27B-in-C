@@ -1,28 +1,39 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -std=c11 -Iinclude -march=native
-LDLIBS  = -lm
+CFLAGS  = -Wall -Wextra -O3 -std=c11 -Iinclude -march=native -mavx2 -mfma
+LDLIBS  = -lm -lpthread
 
-all: build/gguf_test build/test_quant build/test_model build/test_kernels build/test_ops
+SRCS_COMMON = src/gguf.c src/quant.c src/kernels.c src/threadpool.c src/model.c src/tokenizer.c src/sampler.c
+
+all: build/qwen build/test_tokenizer build/test_forward build/test_ops build/test_kernels build/test_quant build/test_model
 
 build:
 	mkdir -p build
 
-build/gguf_test: src/gguf.c src/main.c include/gguf.h | build
-	$(CC) $(CFLAGS) src/gguf.c src/main.c -o $@ $(LDLIBS)
+build/qwen: src/main.c $(SRCS_COMMON) | build
+	$(CC) $(CFLAGS) src/main.c $(SRCS_COMMON) -o $@ $(LDLIBS)
 
-build/test_quant: src/gguf.c src/quant.c src/test_quant.c include/gguf.h include/quant.h | build
-	$(CC) $(CFLAGS) src/gguf.c src/quant.c src/test_quant.c -o $@ $(LDLIBS)
+build/test_tokenizer: src/test_tokenizer.c src/tokenizer.c src/gguf.c | build
+	$(CC) $(CFLAGS) src/test_tokenizer.c src/tokenizer.c src/gguf.c -o $@ $(LDLIBS)
 
-build/test_model: src/gguf.c src/quant.c src/model.c src/test_model.c include/gguf.h include/quant.h include/model.h | build
-	$(CC) $(CFLAGS) src/gguf.c src/quant.c src/model.c src/test_model.c -o $@ $(LDLIBS)
+build/test_forward: src/test_forward.c $(SRCS_COMMON) | build
+	$(CC) $(CFLAGS) src/test_forward.c $(SRCS_COMMON) -o $@ $(LDLIBS)
 
-build/test_kernels: src/gguf.c src/quant.c src/model.c src/kernels.c src/threadpool.c src/test_kernels.c include/gguf.h include/quant.h include/model.h include/kernels.h include/threadpool.h | build
-	$(CC) $(CFLAGS) src/gguf.c src/quant.c src/model.c src/kernels.c src/threadpool.c src/test_kernels.c -o $@ $(LDLIBS)
+build/test_model: src/test_model.c src/gguf.c src/quant.c src/model.c src/kernels.c src/threadpool.c | build
+	$(CC) $(CFLAGS) src/test_model.c src/gguf.c src/quant.c src/model.c src/kernels.c src/threadpool.c -o $@ $(LDLIBS)
 
-build/test_ops: src/kernels.c src/quant.c src/threadpool.c src/test_ops.c include/kernels.h include/quant.h include/threadpool.h | build
-	$(CC) $(CFLAGS) src/kernels.c src/quant.c src/threadpool.c src/test_ops.c -o $@ $(LDLIBS)
+build/test_kernels: src/test_kernels.c src/gguf.c src/quant.c src/model.c src/kernels.c src/threadpool.c | build
+	$(CC) $(CFLAGS) src/test_kernels.c src/gguf.c src/quant.c src/model.c src/kernels.c src/threadpool.c -o $@ $(LDLIBS)
+
+build/test_ops: src/test_ops.c src/kernels.c src/quant.c src/threadpool.c | build
+	$(CC) $(CFLAGS) src/test_ops.c src/kernels.c src/quant.c src/threadpool.c -o $@ $(LDLIBS)
+
+build/test_quant: src/test_quant.c src/gguf.c src/quant.c | build
+	$(CC) $(CFLAGS) src/test_quant.c src/gguf.c src/quant.c -o $@ $(LDLIBS)
 
 clean:
 	rm -rf build
 
-.PHONY: all clean
+serve: build/qwen
+	python3 server.py --port 8080
+
+.PHONY: all clean serve

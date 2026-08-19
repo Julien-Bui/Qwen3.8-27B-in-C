@@ -92,7 +92,12 @@ int main(int argc, char **argv) {
     printf("Tokenizer loaded (%u vocab tokens, %u BPE merges)\n", tok.vocab_size, tok.n_merges);
 
     pool_t *pool = pool_create(n_threads, 1);
-    
+    if (!pool) {
+        fprintf(stderr, "Error creating thread pool\n");
+        tokenizer_free(&tok);
+        model_free(&model);
+        return 1;
+    }
 
     sampler_t *smp = sampler_init(temp, top_p, top_k, repeat_penalty, (uint64_t)time(NULL));
 
