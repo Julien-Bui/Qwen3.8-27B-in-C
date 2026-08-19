@@ -49,47 +49,64 @@ static void dot_f32(const float *w, const float *x, uint64_t n, float *out, uint
 
 /* ---------------- Q8_0 ---------------- */
 static void dot_q8_0(const block_q8_0 *b, size_t nb, const float *x, float *out, uint64_t r) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
     for (size_t i = 0; i < nb; i++) {
-        __builtin_prefetch(&b[i + 2].d, 0, 3);
+        __builtin_prefetch(&b[i + 4], 0, 3);
         fp16_t dh; memcpy(&dh, &b[i].d, 2);
         const __m256 d = _mm256_set1_ps(fp16_to_f32(dh));
-        acc = fmadd16_i8(_mm_loadu_si128((const __m128i *)b[i].qs),
-                         d, x + i * 32, acc);
-        acc = fmadd16_i8(_mm_loadu_si128((const __m128i *)(b[i].qs + 16)),
-                         d, x + i * 32 + 16, acc);
+        acc0 = fmadd16_i8(_mm_loadu_si128((const __m128i *)b[i].qs),
+                          d, x + i * 32, acc0);
+        acc1 = fmadd16_i8(_mm_loadu_si128((const __m128i *)(b[i].qs + 16)),
+                          d, x + i * 32 + 16, acc1);
     }
-    out[r] = hsum256(acc);
+    out[r] = hsum256_2(acc0, acc1);
 }
 
 /* ---------------- IQ4_XS ---------------- */
 static void dot_iq4_xs(const block_iq4_xs *b, size_t nb, const float *x, float *out, uint64_t r) {
     const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
     const __m128i mask4 = _mm_set1_epi8(15);
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
 
     for (size_t i = 0; i < nb; i++) {
-        __builtin_prefetch(&b[i + 2].d, 0, 3);
+        /* bloc de 144 o = 2,25 lignes de cache : prefetch les 3 */
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
         fp16_t dh; memcpy(&dh, &b[i].d, 2);
         const float d = fp16_to_f32(dh);
         const uint8_t *qs = b[i].qs;
 
-        for (int ib = 0; ib < 8; ib++) {
-            const int ls = ((b[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xF)
-                         | (((b[i].scales_h >> 2 * ib) & 3) << 4);
-            const __m256 dl = _mm256_set1_ps(d * (float)(ls - 32));
+        for (int ib = 0; ib < 8; ib += 2) {
+            const int ls0 = ((b[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xF)
+                          | (((b[i].scales_h >> 2 * ib) & 3) << 4);
+            const __m256 dl0 = _mm256_set1_ps(d * (float)(ls0 - 32));
+            const int ib1 = ib + 1;
+            const int ls1 = ((b[i].scales_l[ib1 / 2] >> 4 * (ib1 % 2)) & 0xF)
+                          | (((b[i].scales_h >> 2 * ib1) & 3) << 4);
+            const __m256 dl1 = _mm256_set1_ps(d * (float)(ls1 - 32));
 
-            const __m128i bytes = _mm_loadu_si128((const __m128i *)(qs + ib * 16));
-            const __m128i lo4 = _mm_and_si128(bytes, mask4);                /* elems 0..15  */
-            const __m128i hi4 = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask4); /* 16..31 */
+            const __m128i bytes0 = _mm_loadu_si128((const __m128i *)(qs + ib * 16));
+            const __m128i lo4_0 = _mm_and_si128(bytes0, mask4);
+            const __m128i hi4_0 = _mm_and_si128(_mm_srli_epi16(bytes0, 4), mask4);
+            acc0 = fmadd16_i8(_mm_shuffle_epi8(lut, lo4_0), dl0,
+                              x + i * 256 + ib * 32, acc0);
+            acc0 = fmadd16_i8(_mm_shuffle_epi8(lut, hi4_0), dl0,
+                              x + i * 256 + ib * 32 + 16, acc0);
 
-            acc = fmadd16_i8(_mm_shuffle_epi8(lut, lo4), dl,
-                             x + i * 256 + ib * 32, acc);
-            acc = fmadd16_i8(_mm_shuffle_epi8(lut, hi4), dl,
-                             x + i * 256 + ib * 32 + 16, acc);
+            const __m128i bytes1 = _mm_loadu_si128((const __m128i *)(qs + ib1 * 16));
+            const __m128i lo4_1 = _mm_and_si128(bytes1, mask4);
+            const __m128i hi4_1 = _mm_and_si128(_mm_srli_epi16(bytes1, 4), mask4);
+            acc1 = fmadd16_i8(_mm_shuffle_epi8(lut, lo4_1), dl1,
+                              x + i * 256 + ib1 * 32, acc1);
+            acc1 = fmadd16_i8(_mm_shuffle_epi8(lut, hi4_1), dl1,
+                              x + i * 256 + ib1 * 32 + 16, acc1);
         }
     }
-    out[r] = hsum256(acc);
+    out[r] = hsum256_2(acc0, acc1);
 }
 
 /* ------------- Q4_K / Q5_K : tranches de 16 nibbles + échelle const ------------- */
@@ -117,11 +134,15 @@ static void xsums32(const float *x, uint64_t n32, float *xs) {
 static void dot_q4_K(const block_q4_K *b, size_t nb, const float *x,
                      const float *xs, float *out, uint64_t r) {
     const __m128i mask4 = _mm_set1_epi8(15);
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
     float accm = 0;
 
     for (size_t i = 0; i < nb; i++) {
-        __builtin_prefetch(&b[i + 2].d, 0, 3);
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
         fp16_t dh, dmh; memcpy(&dh, &b[i].d, 2); memcpy(&dmh, &b[i].dmin, 2);
         const float d = fp16_to_f32(dh), dm = fp16_to_f32(dmh);
 
@@ -139,15 +160,15 @@ static void dot_q4_K(const block_q4_K *b, size_t nb, const float *x,
             const __m128i b0 = _mm_loadu_si128(q16);     /* octets 0..15  */
             const __m128i b1 = _mm_loadu_si128(q16 + 1); /* octets 16..31 */
 
-            acc = fmadd16_i8(nib_lo(b0, mask4), d1, x + base,      acc); /* 0..15  */
-            acc = fmadd16_i8(nib_lo(b1, mask4), d1, x + base + 16, acc); /* 16..31 */
-            acc = fmadd16_i8(nib_hi(b0, mask4), d2, x + base + 32, acc); /* 32..47 */
-            acc = fmadd16_i8(nib_hi(b1, mask4), d2, x + base + 48, acc); /* 48..63 */
+            acc0 = fmadd16_i8(nib_lo(b0, mask4), d1, x + base,      acc0); /* 0..15  */
+            acc0 = fmadd16_i8(nib_lo(b1, mask4), d1, x + base + 16, acc0); /* 16..31 */
+            acc1 = fmadd16_i8(nib_hi(b0, mask4), d2, x + base + 32, acc1); /* 32..47 */
+            acc1 = fmadd16_i8(nib_hi(b1, mask4), d2, x + base + 48, acc1); /* 48..63 */
 
             accm += m1 * xs[i * 8 + 2 * g] + m2 * xs[i * 8 + 2 * g + 1];
         }
     }
-    out[r] = hsum256(acc) - accm;
+    out[r] = hsum256_2(acc0, acc1) - accm;
 }
 
 /* ------------- Q5_K ------------- */
@@ -155,11 +176,15 @@ static void dot_q5_K(const block_q5_K *b, size_t nb, const float *x,
                      const float *xs, float *out, uint64_t r) {
     const __m128i mask4 = _mm_set1_epi8(15);
     const __m128i one = _mm_set1_epi8(1);
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
     float accm = 0;
 
     for (size_t i = 0; i < nb; i++) {
-        __builtin_prefetch(&b[i + 2].d, 0, 3);
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
         fp16_t dh, dmh; memcpy(&dh, &b[i].d, 2); memcpy(&dmh, &b[i].dmin, 2);
         const float d = fp16_to_f32(dh), dm = fp16_to_f32(dmh);
 
@@ -189,19 +214,19 @@ static void dot_q5_K(const block_q5_K *b, size_t nb, const float *x,
             const __m128i b0 = _mm_loadu_si128(q16);
             const __m128i b1 = _mm_loadu_si128(q16 + 1);
 
-            acc = fmadd16_i8(_mm_add_epi8(nib_lo(b0, mask4), bitla),
-                             _mm256_set1_ps(d1), x + base, acc);        /* 0..15  */
-            acc = fmadd16_i8(_mm_add_epi8(nib_lo(b1, mask4), bitlb),
-                             _mm256_set1_ps(d1), x + base + 16, acc);   /* 16..31 */
-            acc = fmadd16_i8(_mm_add_epi8(nib_hi(b0, mask4), bitha),
-                             _mm256_set1_ps(d2), x + base + 32, acc);   /* 32..47 */
-            acc = fmadd16_i8(_mm_add_epi8(nib_hi(b1, mask4), bithb),
-                             _mm256_set1_ps(d2), x + base + 48, acc);   /* 48..63 */
+            acc0 = fmadd16_i8(_mm_add_epi8(nib_lo(b0, mask4), bitla),
+                             _mm256_set1_ps(d1), x + base, acc0);        /* 0..15  */
+            acc0 = fmadd16_i8(_mm_add_epi8(nib_lo(b1, mask4), bitlb),
+                             _mm256_set1_ps(d1), x + base + 16, acc0);   /* 16..31 */
+            acc1 = fmadd16_i8(_mm_add_epi8(nib_hi(b0, mask4), bitha),
+                             _mm256_set1_ps(d2), x + base + 32, acc1);   /* 32..47 */
+            acc1 = fmadd16_i8(_mm_add_epi8(nib_hi(b1, mask4), bithb),
+                             _mm256_set1_ps(d2), x + base + 48, acc1);   /* 48..63 */
 
             accm += m1 * xs[i * 8 + 2 * g] + m2 * xs[i * 8 + 2 * g + 1];
         }
     }
-    out[r] = hsum256(acc) - accm;
+    out[r] = hsum256_2(acc0, acc1) - accm;
 }
 
 /* ------------- Q6_K ------------- */
@@ -209,10 +234,16 @@ static void dot_q6_K(const block_q6_K *b, size_t nb, const float *x, float *out,
     const __m128i mask4 = _mm_set1_epi8(15);
     const __m128i mask3 = _mm_set1_epi8(3);
     const __m128i c32 = _mm_set1_epi8(32);
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
 
     for (size_t i = 0; i < nb; i++) {
-        __builtin_prefetch(&b[i + 2].d, 0, 3);
+        /* bloc de 210 o = 3,28 lignes de cache : prefetch les 4 */
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
+        __builtin_prefetch(pf + 192, 0, 3);
         fp16_t dh; memcpy(&dh, &b[i].d, 2);
         const float d = fp16_to_f32(dh);
 
@@ -233,29 +264,29 @@ static void dot_q6_K(const block_q6_K *b, size_t nb, const float *x, float *out,
                 q = _mm_sub_epi8(_mm_add_epi8(
                         _mm_and_si128(qlv, mask4),
                         _mm_slli_epi16(_mm_and_si128(qhv, mask3), 4)), c32);
-                acc = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 0]), x + xb, acc);
+                acc0 = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 0]), x + xb, acc0);
 
                 /* elems l+32 : (ql32&0xF)|((qh>>2)&3)<<4 */
                 q = _mm_sub_epi8(_mm_add_epi8(
                         _mm_and_si128(qlv2, mask4),
                         _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 2), mask3), 4)), c32);
-                acc = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 2]), x + xb + 32, acc);
+                acc1 = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 2]), x + xb + 32, acc1);
 
                 /* elems l+64 : (ql>>4)|((qh>>4)&3)<<4 */
                 q = _mm_sub_epi8(_mm_add_epi8(
                         _mm_and_si128(_mm_srli_epi16(qlv, 4), mask4),
                         _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 4), mask3), 4)), c32);
-                acc = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 4]), x + xb + 64, acc);
+                acc0 = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 4]), x + xb + 64, acc0);
 
                 /* elems l+96 : (ql32>>4)|((qh>>6)&3)<<4 */
                 q = _mm_sub_epi8(_mm_add_epi8(
                         _mm_and_si128(_mm_srli_epi16(qlv2, 4), mask4),
                         _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 6), mask3), 4)), c32);
-                acc = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 6]), x + xb + 96, acc);
+                acc1 = fmadd16_i8(q, _mm256_set1_ps(d * sc[hh + 6]), x + xb + 96, acc1);
             }
         }
     }
-    out[r] = hsum256(acc);
+    out[r] = hsum256_2(acc0, acc1);
 }
 
 /* ============================ Dispatch ============================ */
@@ -289,6 +320,285 @@ void gemv_rows(const gguf_tensor_info_t *W, const float *x,
     }
 }
 
+/* ==================== GEMV batché (décodage spéculatif) ====================
+ * Mêmes poids balayés UNE fois pour n vecteurs d'activation (n <= 4).
+ * X : [n][ldx] (ldx >= ne0), out : [n][ldo]. Même ordre d'accumulation que
+ * les kernels mono-token -> résultats bit-à-bit identiques. */
+
+#define GEMV_MAX_B 4
+
+/* acc[0..n-1] += (q * ds) · x[t][off..off+15] */
+static inline void fmadd16_i8_n(__m128i q, __m256 ds, const float *xb, uint64_t ldx,
+                                int n, __m256 *acc, uint64_t off) {
+    __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q));
+    __m256 w0 = _mm256_mul_ps(vf, ds);
+    for (int t = 0; t < n; t++)
+        acc[t] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xb + t * ldx + off), acc[t]);
+    vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_bsrli_si128(q, 8)));
+    __m256 w1 = _mm256_mul_ps(vf, ds);
+    for (int t = 0; t < n; t++)
+        acc[t] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xb + t * ldx + off + 8), acc[t]);
+}
+
+static void dot_f32_b(const float *w, const float *x, uint64_t ldx, int n,
+                      float *out, uint64_t ldo, uint64_t r, uint64_t len) {
+    __m256 acc[GEMV_MAX_B];
+    for (int t = 0; t < n; t++) acc[t] = _mm256_setzero_ps();
+    const uint64_t tail = len & ~(uint64_t)7;
+    for (uint64_t i = 0; i + 8 <= len; i += 8) {
+        __m256 vw = _mm256_loadu_ps(w + i);
+        for (int t = 0; t < n; t++)
+            acc[t] = _mm256_fmadd_ps(vw, _mm256_loadu_ps(x + t * ldx + i), acc[t]);
+    }
+    for (int t = 0; t < n; t++) {
+        float s = hsum256(acc[t]);
+        for (uint64_t i = tail; i < len; i++) s += w[i] * x[t * ldx + i];
+        out[t * ldo + r] = s;
+    }
+}
+
+static void dot_q8_0_b(const block_q8_0 *b, size_t nb, const float *x, uint64_t ldx,
+                       int n, float *out, uint64_t ldo, uint64_t r) {
+    __m256 acc0[GEMV_MAX_B], acc1[GEMV_MAX_B];
+    for (int t = 0; t < n; t++) { acc0[t] = acc1[t] = _mm256_setzero_ps(); }
+    for (size_t i = 0; i < nb; i++) {
+        __builtin_prefetch(&b[i + 4], 0, 3);
+        fp16_t dh; memcpy(&dh, &b[i].d, 2);
+        const __m256 d = _mm256_set1_ps(fp16_to_f32(dh));
+        fmadd16_i8_n(_mm_loadu_si128((const __m128i *)b[i].qs), d, x, ldx, n, acc0, i * 32);
+        fmadd16_i8_n(_mm_loadu_si128((const __m128i *)(b[i].qs + 16)), d, x, ldx, n, acc1, i * 32 + 16);
+    }
+    for (int t = 0; t < n; t++) out[t * ldo + r] = hsum256_2(acc0[t], acc1[t]);
+}
+
+static void dot_iq4_xs_b(const block_iq4_xs *b, size_t nb, const float *x, uint64_t ldx,
+                         int n, float *out, uint64_t ldo, uint64_t r) {
+    const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+    const __m128i mask4 = _mm_set1_epi8(15);
+    __m256 acc0[GEMV_MAX_B], acc1[GEMV_MAX_B];
+    for (int t = 0; t < n; t++) { acc0[t] = acc1[t] = _mm256_setzero_ps(); }
+
+    for (size_t i = 0; i < nb; i++) {
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
+        fp16_t dh; memcpy(&dh, &b[i].d, 2);
+        const float d = fp16_to_f32(dh);
+        const uint8_t *qs = b[i].qs;
+
+        for (int ib = 0; ib < 8; ib += 2) {
+            const int ls0 = ((b[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xF)
+                          | (((b[i].scales_h >> 2 * ib) & 3) << 4);
+            const __m256 dl0 = _mm256_set1_ps(d * (float)(ls0 - 32));
+            const int ib1 = ib + 1;
+            const int ls1 = ((b[i].scales_l[ib1 / 2] >> 4 * (ib1 % 2)) & 0xF)
+                          | (((b[i].scales_h >> 2 * ib1) & 3) << 4);
+            const __m256 dl1 = _mm256_set1_ps(d * (float)(ls1 - 32));
+
+            const __m128i bytes0 = _mm_loadu_si128((const __m128i *)(qs + ib * 16));
+            fmadd16_i8_n(_mm_shuffle_epi8(lut, _mm_and_si128(bytes0, mask4)), dl0,
+                         x, ldx, n, acc0, i * 256 + ib * 32);
+            fmadd16_i8_n(_mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(bytes0, 4), mask4)), dl0,
+                         x, ldx, n, acc0, i * 256 + ib * 32 + 16);
+
+            const __m128i bytes1 = _mm_loadu_si128((const __m128i *)(qs + ib1 * 16));
+            fmadd16_i8_n(_mm_shuffle_epi8(lut, _mm_and_si128(bytes1, mask4)), dl1,
+                         x, ldx, n, acc1, i * 256 + ib1 * 32);
+            fmadd16_i8_n(_mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(bytes1, 4), mask4)), dl1,
+                         x, ldx, n, acc1, i * 256 + ib1 * 32 + 16);
+        }
+    }
+    for (int t = 0; t < n; t++) out[t * ldo + r] = hsum256_2(acc0[t], acc1[t]);
+}
+
+static void dot_q4_K_b(const block_q4_K *b, size_t nb, const float *x, uint64_t ldx,
+                       const float *xs, int n, float *out, uint64_t ldo, uint64_t r) {
+    const __m128i mask4 = _mm_set1_epi8(15);
+    __m256 acc0[GEMV_MAX_B], acc1[GEMV_MAX_B];
+    float accm[GEMV_MAX_B];
+    for (int t = 0; t < n; t++) { acc0[t] = acc1[t] = _mm256_setzero_ps(); accm[t] = 0; }
+
+    for (size_t i = 0; i < nb; i++) {
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
+        fp16_t dh, dmh; memcpy(&dh, &b[i].d, 2); memcpy(&dmh, &b[i].dmin, 2);
+        const float d = fp16_to_f32(dh), dm = fp16_to_f32(dmh);
+
+        for (int g = 0; g < 4; g++) {
+            uint8_t sc, m;
+            get_scale_min_k4(2 * g,     b[i].scales, &sc, &m);
+            const __m256 d1 = _mm256_set1_ps(d * sc);
+            const float m1 = dm * m;
+            get_scale_min_k4(2 * g + 1, b[i].scales, &sc, &m);
+            const __m256 d2 = _mm256_set1_ps(d * sc);
+            const float m2 = dm * m;
+
+            const uint64_t base = i * 256 + g * 64;
+            const __m128i *q16 = (const __m128i *)(b[i].qs + g * 32);
+            const __m128i b0 = _mm_loadu_si128(q16);
+            const __m128i b1 = _mm_loadu_si128(q16 + 1);
+
+            fmadd16_i8_n(nib_lo(b0, mask4), d1, x, ldx, n, acc0, base);
+            fmadd16_i8_n(nib_lo(b1, mask4), d1, x, ldx, n, acc0, base + 16);
+            fmadd16_i8_n(nib_hi(b0, mask4), d2, x, ldx, n, acc1, base + 32);
+            fmadd16_i8_n(nib_hi(b1, mask4), d2, x, ldx, n, acc1, base + 48);
+
+            for (int t = 0; t < n; t++)
+                accm[t] += m1 * xs[t * (nb * 8) + i * 8 + 2 * g]
+                         + m2 * xs[t * (nb * 8) + i * 8 + 2 * g + 1];
+        }
+    }
+    for (int t = 0; t < n; t++) out[t * ldo + r] = hsum256_2(acc0[t], acc1[t]) - accm[t];
+}
+
+static void dot_q5_K_b(const block_q5_K *b, size_t nb, const float *x, uint64_t ldx,
+                       const float *xs, int n, float *out, uint64_t ldo, uint64_t r) {
+    const __m128i mask4 = _mm_set1_epi8(15);
+    const __m128i one = _mm_set1_epi8(1);
+    __m256 acc0[GEMV_MAX_B], acc1[GEMV_MAX_B];
+    float accm[GEMV_MAX_B];
+    for (int t = 0; t < n; t++) { acc0[t] = acc1[t] = _mm256_setzero_ps(); accm[t] = 0; }
+
+    for (size_t i = 0; i < nb; i++) {
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
+        fp16_t dh, dmh; memcpy(&dh, &b[i].d, 2); memcpy(&dmh, &b[i].dmin, 2);
+        const float d = fp16_to_f32(dh), dm = fp16_to_f32(dmh);
+
+        for (int g = 0; g < 4; g++) {
+            uint8_t sc, m;
+            get_scale_min_k4(2 * g,     b[i].scales, &sc, &m);
+            const float d1 = d * sc, m1 = dm * m;
+            get_scale_min_k4(2 * g + 1, b[i].scales, &sc, &m);
+            const float d2 = d * sc, m2 = dm * m;
+
+            const uint64_t base = i * 256 + g * 64;
+            const __m128i *q16 = (const __m128i *)(b[i].qs + g * 32);
+            const __m128i qha = _mm_loadu_si128((const __m128i *)(b[i].qh));
+            const __m128i qhb = _mm_loadu_si128((const __m128i *)(b[i].qh + 16));
+            const __m128i bitla = _mm_slli_epi16(
+                _mm_and_si128(_mm_srli_epi16(qha, 2 * g), one), 4);
+            const __m128i bitlb = _mm_slli_epi16(
+                _mm_and_si128(_mm_srli_epi16(qhb, 2 * g), one), 4);
+            const __m128i bitha = _mm_slli_epi16(
+                _mm_and_si128(_mm_srli_epi16(qha, 2 * g + 1), one), 4);
+            const __m128i bithb = _mm_slli_epi16(
+                _mm_and_si128(_mm_srli_epi16(qhb, 2 * g + 1), one), 4);
+
+            const __m128i b0 = _mm_loadu_si128(q16);
+            const __m128i b1 = _mm_loadu_si128(q16 + 1);
+
+            fmadd16_i8_n(_mm_add_epi8(nib_lo(b0, mask4), bitla),
+                         _mm256_set1_ps(d1), x, ldx, n, acc0, base);
+            fmadd16_i8_n(_mm_add_epi8(nib_lo(b1, mask4), bitlb),
+                         _mm256_set1_ps(d1), x, ldx, n, acc0, base + 16);
+            fmadd16_i8_n(_mm_add_epi8(nib_hi(b0, mask4), bitha),
+                         _mm256_set1_ps(d2), x, ldx, n, acc1, base + 32);
+            fmadd16_i8_n(_mm_add_epi8(nib_hi(b1, mask4), bithb),
+                         _mm256_set1_ps(d2), x, ldx, n, acc1, base + 48);
+
+            for (int t = 0; t < n; t++)
+                accm[t] += m1 * xs[t * (nb * 8) + i * 8 + 2 * g]
+                         + m2 * xs[t * (nb * 8) + i * 8 + 2 * g + 1];
+        }
+    }
+    for (int t = 0; t < n; t++) out[t * ldo + r] = hsum256_2(acc0[t], acc1[t]) - accm[t];
+}
+
+static void dot_q6_K_b(const block_q6_K *b, size_t nb, const float *x, uint64_t ldx,
+                       int n, float *out, uint64_t ldo, uint64_t r) {
+    const __m128i mask4 = _mm_set1_epi8(15);
+    const __m128i mask3 = _mm_set1_epi8(3);
+    const __m128i c32 = _mm_set1_epi8(32);
+    __m256 acc0[GEMV_MAX_B], acc1[GEMV_MAX_B];
+    for (int t = 0; t < n; t++) { acc0[t] = acc1[t] = _mm256_setzero_ps(); }
+
+    for (size_t i = 0; i < nb; i++) {
+        const char *pf = (const char *)&b[i + 2];
+        __builtin_prefetch(pf, 0, 3);
+        __builtin_prefetch(pf + 64, 0, 3);
+        __builtin_prefetch(pf + 128, 0, 3);
+        __builtin_prefetch(pf + 192, 0, 3);
+        fp16_t dh; memcpy(&dh, &b[i].d, 2);
+        const float d = fp16_to_f32(dh);
+
+        for (int nn = 0; nn < 2; nn++) {
+            const __m128i *ql16 = (const __m128i *)(b[i].ql + nn * 64);
+            const __m128i *qh16 = (const __m128i *)(b[i].qh + nn * 32);
+            const int8_t *sc = b[i].scales + nn * 8;
+            const uint64_t base = i * 256 + nn * 128;
+
+            for (int hh = 0; hh < 2; hh++) {
+                const __m128i qlv  = _mm_loadu_si128(ql16 + hh);
+                const __m128i qlv2 = _mm_loadu_si128(ql16 + hh + 2);
+                const __m128i qhv  = _mm_loadu_si128(qh16 + hh);
+                const uint64_t xb = base + hh * 16;
+                __m128i q;
+
+                q = _mm_sub_epi8(_mm_add_epi8(
+                        _mm_and_si128(qlv, mask4),
+                        _mm_slli_epi16(_mm_and_si128(qhv, mask3), 4)), c32);
+                fmadd16_i8_n(q, _mm256_set1_ps(d * sc[hh + 0]), x, ldx, n, acc0, xb);
+
+                q = _mm_sub_epi8(_mm_add_epi8(
+                        _mm_and_si128(qlv2, mask4),
+                        _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 2), mask3), 4)), c32);
+                fmadd16_i8_n(q, _mm256_set1_ps(d * sc[hh + 2]), x, ldx, n, acc1, xb + 32);
+
+                q = _mm_sub_epi8(_mm_add_epi8(
+                        _mm_and_si128(_mm_srli_epi16(qlv, 4), mask4),
+                        _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 4), mask3), 4)), c32);
+                fmadd16_i8_n(q, _mm256_set1_ps(d * sc[hh + 4]), x, ldx, n, acc0, xb + 64);
+
+                q = _mm_sub_epi8(_mm_add_epi8(
+                        _mm_and_si128(_mm_srli_epi16(qlv2, 4), mask4),
+                        _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhv, 6), mask3), 4)), c32);
+                fmadd16_i8_n(q, _mm256_set1_ps(d * sc[hh + 6]), x, ldx, n, acc1, xb + 96);
+            }
+        }
+    }
+    for (int t = 0; t < n; t++) out[t * ldo + r] = hsum256_2(acc0[t], acc1[t]);
+}
+
+/* Per-token xsums: compact layout [t][n32] */
+static _Thread_local float tls_xsum_b[GEMV_MAX_B * MAX_XSUM32];
+
+void gemv_rows_batch(const gguf_tensor_info_t *W, const float *x, uint64_t ldx, int n,
+                     float *out, uint64_t ldo, uint64_t r0, uint64_t r1) {
+    const uint64_t ne0 = W->ne[0];
+    const size_t be = (W->type == GGML_Q8_0) ? QK8_0 : QK_K;
+
+    if (W->type == GGML_Q4_K || W->type == GGML_Q5_K) {
+        const uint64_t n32 = ne0 / 32;
+        if (n32 <= MAX_XSUM32)
+            for (int t = 0; t < n; t++)
+                xsums32(x + t * ldx, n32, tls_xsum_b + t * n32);
+    }
+
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint8_t *row = (const uint8_t *)quant_row_ptr(W, r);
+        const uint64_t nb = ne0 / be;
+        switch (W->type) {
+        case GGML_F32:    dot_f32_b((const float *)row, x, ldx, n, out, ldo, r, ne0);    break;
+        case GGML_Q8_0:   dot_q8_0_b((const block_q8_0 *)row, nb, x, ldx, n, out, ldo, r);   break;
+        case GGML_IQ4_XS: dot_iq4_xs_b((const block_iq4_xs *)row, nb, x, ldx, n, out, ldo, r); break;
+        case GGML_Q4_K:   dot_q4_K_b((const block_q4_K *)row, nb, x, ldx,
+                                     (ne0 / 32 <= MAX_XSUM32) ? tls_xsum_b : NULL,
+                                     n, out, ldo, r); break;
+        case GGML_Q5_K:   dot_q5_K_b((const block_q5_K *)row, nb, x, ldx,
+                                     (ne0 / 32 <= MAX_XSUM32) ? tls_xsum_b : NULL,
+                                     n, out, ldo, r); break;
+        case GGML_Q6_K:   dot_q6_K_b((const block_q6_K *)row, nb, x, ldx, n, out, ldo, r);   break;
+        default:          for (int t = 0; t < n; t++) out[t * ldo + r] = 0.0f; break;
+        }
+    }
+}
+
 /* ============================ Parallélisation ============================ */
 typedef struct {
     const gguf_tensor_info_t *W;
@@ -309,6 +619,33 @@ void gemv(pool_t *pool, const gguf_tensor_info_t *W, const float *x, float *out)
         pool_run(pool, gemv_chunk, &job);
     else
         gemv_chunk(&job, 0, 1);
+}
+
+typedef struct {
+    const gguf_tensor_info_t *W;
+    const float *x;
+    uint64_t ldx;
+    int n;
+    float *out;
+    uint64_t ldo;
+} gemv_batch_job_t;
+
+static void gemv_batch_chunk(void *arg, int tid, int ntid) {
+    gemv_batch_job_t *j = arg;
+    const uint64_t rows = j->W->ne[1];
+    gemv_rows_batch(j->W, j->x, j->ldx, j->n, j->out, j->ldo,
+                    rows * (uint64_t)tid / ntid,
+                    rows * (uint64_t)(tid + 1) / ntid);
+}
+
+void gemv_batch(pool_t *pool, const gguf_tensor_info_t *W,
+                const float *x, uint64_t ldx, int n,
+                float *out, uint64_t ldo) {
+    gemv_batch_job_t job = { W, x, ldx, n, out, ldo };
+    if (pool)
+        pool_run(pool, gemv_batch_chunk, &job);
+    else
+        gemv_batch_chunk(&job, 0, 1);
 }
 
 /* ======================== Module D1 : Ops ======================== */
