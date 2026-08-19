@@ -1,2 +1,24 @@
+# Models
 *.gguf
+*.bin
+
+# Build artifacts
 build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+.venv/
+env/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
