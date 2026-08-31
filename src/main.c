@@ -107,8 +107,20 @@ int main(int argc, char **argv) {
 
     sampler_t *smp = sampler_init(temp, top_p, top_k, repeat_penalty, (uint64_t)time(NULL));
 
+    if (n_ctx < 2) n_ctx = 2;
+
     uint32_t prompt_tokens[1024];
     uint32_t n_prompt = tokenizer_encode(&tok, prompt, prompt_tokens, 1024, false);
+    if (n_prompt > n_ctx) {
+        fprintf(stderr, "\nWarning: prompt (%u tokens) exceeds context size (%u); truncating\n",
+                n_prompt, n_ctx);
+        n_prompt = n_ctx;
+    }
+    if ((uint64_t)n_prompt + n_predict > 2048) {
+        fprintf(stderr, "\nWarning: n_predict clamped to %u (history buffer limit)\n",
+                2048 - n_prompt);
+        n_predict = 2048 - n_prompt;
+    }
     printf("\nPrompt (%u tokens): %s\n", n_prompt, prompt);
     printf("Generation: ");
     fflush(stdout);
@@ -136,10 +148,17 @@ int main(int argc, char **argv) {
          * Lossless: output stream exactly matches backbone greedy decode. ---- */
         if (n_spec > SPEC_MAX_B - 1) n_spec = SPEC_MAX_B - 1;
         uint64_t n_cycles = 0, n_accepted_drafts = 0, n_acc_depth1 = 0, n_acc_depth2 = 0;
+        uint64_t n_drafts_total = 0;
         const float *last_logits = model.logits;
 
         while (generated < n_predict) {
             const uint32_t P = model.pos - 1;   /* Position of last processed token */
+            /* room = number of KV positions still writable (P+1 .. n_ctx-1).
+             * Clamp the draft count so that the batched verification and the
+             * MTP draft forwards never write KV entries beyond n_ctx-1. */
+            const uint32_t room = n_ctx - 1 - P;
+            if (room < 1) break;
+            const uint32_t k = (n_spec < room - 1) ? n_spec : room - 1;
             uint32_t cand[SPEC_MAX_B];
             cand[0] = model_sample_greedy(last_logits, model.cfg.vocab_size);
             if (getenv("QWEN_SPEC_DEBUG"))
@@ -148,18 +167,18 @@ int main(int argc, char **argv) {
             if (cand[0] == tok.eos_id) break;
 
             /* MTP drafts: cand[1..k] */
-            for (uint32_t s = 1; s <= n_spec; s++) {
+            for (uint32_t s = 1; s <= k; s++) {
                 mtp_forward(&model, pool, cand[s - 1], P + s, 1);
                 cand[s] = model_sample_greedy(model.logits, model.cfg.vocab_size);
             }
-            const uint32_t B = n_spec + 1;
+            const uint32_t B = k + 1;
 
             /* Batched verification: single pass over model weights */
             model_forward_batch(&model, pool, cand, P + 1, B);
 
-            /* j = first mismatch index (all accepted if j == n_spec) */
-            uint32_t j = n_spec;
-            for (uint32_t i = 0; i < n_spec; i++) {
+            /* j = first mismatch index (all accepted if j == k) */
+            uint32_t j = k;
+            for (uint32_t i = 0; i < k; i++) {
                 const uint32_t v = model_sample_greedy(
                     model.logits_b + (size_t)i * model.cfg.vocab_size, model.cfg.vocab_size);
                 if (v != cand[i + 1]) { j = i; break; }
@@ -173,13 +192,14 @@ int main(int argc, char **argv) {
                 generated++;
             }
             n_accepted_drafts += j;
+            n_drafts_total += k;
             if (j >= 1) n_acc_depth1++;
             if (j >= 2) n_acc_depth2++;
             fflush(stdout);
             if (model.pos >= n_ctx) break;
 
             /* Rollback recurrent states if drafts rejected */
-            if (j < n_spec) {
+            if (j < k) {
                 model_rollback_to(&model, j);
                 model.pos = P + j + 2;
             }
@@ -194,8 +214,8 @@ int main(int argc, char **argv) {
         if (n_cycles)
             fprintf(stderr, "[spec] %llu cycles, %llu/%llu drafts accepted (%.0f%%) [depth: %llu x1, %llu x2]\n",
                     (unsigned long long)n_cycles, (unsigned long long)n_accepted_drafts,
-                    (unsigned long long)(n_cycles * n_spec),
-                    100.0 * (double)n_accepted_drafts / (double)(n_cycles * n_spec),
+                    (unsigned long long)n_drafts_total,
+                    100.0 * (double)n_accepted_drafts / (double)n_drafts_total,
                     (unsigned long long)n_acc_depth1, (unsigned long long)n_acc_depth2);
     } else {
         uint32_t cur_token = sampler_sample(smp, model.logits, model.cfg.vocab_size, all_tokens, n_all);
