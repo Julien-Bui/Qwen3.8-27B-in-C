@@ -320,12 +320,11 @@ void gemv_rows(const gguf_tensor_info_t *W, const float *x,
     }
 }
 
-/* ==================== GEMV batché (décodage spéculatif) ====================
- * Mêmes poids balayés UNE fois pour n vecteurs d'activation (n <= 4).
+/* ==================== GEMV batché (décodage spéculatif / prefill) ====================
+ * Mêmes poids balayés UNE fois pour n vecteurs d'activation (n <= GEMV_MAX_B :
+ * vérification spéculative B<=SPEC_MAX_B, chunks de prefill B<=PREFILL_MAX_B).
  * X : [n][ldx] (ldx >= ne0), out : [n][ldo]. Même ordre d'accumulation que
  * les kernels mono-token -> résultats bit-à-bit identiques. */
-
-#define GEMV_MAX_B 4
 
 /* acc[0..n-1] += (q * ds) · x[t][off..off+15] */
 static inline void fmadd16_i8_n(__m128i q, __m256 ds, const float *xb, uint64_t ldx,

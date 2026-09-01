@@ -14,8 +14,9 @@ void gemv_rows(const gguf_tensor_info_t *W, const float *x,
 /* Multithreaded GEMV: partitions rows across thread pool. */
 void gemv(pool_t *pool, const gguf_tensor_info_t *W, const float *x, float *out);
 
-/* Batched GEMV (for speculative decoding): out[t][r] = dot(x[t], row r)
- * for n <= 4 vectors, x : [n][ldx], out : [n][ldo]. Weights read only once. */
+/* Batched GEMV (speculative decoding / prefill): out[t][r] = dot(x[t], row r)
+ * for n <= GEMV_MAX_B vectors, x : [n][ldx], out : [n][ldo]. Weights read only once. */
+#define GEMV_MAX_B 8
 void gemv_rows_batch(const gguf_tensor_info_t *W, const float *x, uint64_t ldx, int n,
                      float *out, uint64_t ldo, uint64_t r0, uint64_t r1);
 void gemv_batch(pool_t *pool, const gguf_tensor_info_t *W,

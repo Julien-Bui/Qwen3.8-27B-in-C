@@ -22,26 +22,27 @@ int main(int argc, char **argv) {
     };
     int n_fail = 0;
     srand(42);
+    const int NB = GEMV_MAX_B;
 
     for (size_t k = 0; k < sizeof names / sizeof names[0]; k++) {
         const gguf_tensor_info_t *W = gguf_find_tensor(&m.gguf, names[k]);
         if (!W) { printf("%-32s ABSENT\n", names[k]); continue; }
         const uint64_t ne0 = W->ne[0], rows = W->ne[1];
 
-        float *x = malloc(4 * ne0 * sizeof(float));
-        float *ref = malloc(4 * (size_t)rows * sizeof(float));
-        float *got = malloc(4 * (size_t)rows * sizeof(float));
+        float *x = malloc(NB * ne0 * sizeof(float));
+        float *ref = malloc(NB * (size_t)rows * sizeof(float));
+        float *got = malloc(NB * (size_t)rows * sizeof(float));
         float *single = malloc(rows * sizeof(float));
-        for (uint64_t i = 0; i < 4 * ne0; i++) x[i] = (float)(rand() % 2000 - 1000) / 331.0f;
+        for (uint64_t i = 0; i < NB * ne0; i++) x[i] = (float)(rand() % 2000 - 1000) / 331.0f;
 
         /* reference : n appels mono-token */
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < NB; t++) {
             gemv(pool, W, x + t * ne0, single);
             memcpy(ref + t * rows, single, rows * sizeof(float));
         }
 
-        for (int n = 1; n <= 4; n++) {
-            memset(got, 0, 4 * (size_t)rows * sizeof(float));
+        for (int n = 1; n <= NB; n++) {
+            memset(got, 0, NB * (size_t)rows * sizeof(float));
             gemv_batch(pool, W, x, ne0, n, got, rows);
             int bad = 0;
             double maxd = 0;
