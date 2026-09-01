@@ -130,13 +130,25 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < n_prompt; i++) all_tokens[n_all++] = prompt_tokens[i];
 
     double t_prefill_start = get_time_sec();
-    for (uint32_t pos = 0; pos < n_prompt; pos++) {
-        model_forward(&model, pool, prompt_tokens[pos], pos);
-        if (n_spec > 0) {
-            /* MTP anchor: fills MTP KV cache and produces h_nextn */
-            memcpy(model.mtp_h, model.x, model.dims.n_embd * sizeof(float));
-            mtp_forward(&model, pool, prompt_tokens[pos], pos, 0);
+    {
+        /* Prefill batché : chunks de PREFILL_MAX_B tokens -> les 14,7 Go de
+         * poids sont balayés une seule fois par chunk au lieu d'une par token.
+         * Bit-exact vs prefill séquentiel (kernels batch == mono-token). */
+        uint32_t pos = 0, lastB = 0;
+        while (pos < n_prompt) {
+            uint32_t B = n_prompt - pos;
+            if (B > PREFILL_MAX_B) B = PREFILL_MAX_B;
+            model_forward_batch(&model, pool, &prompt_tokens[pos], pos, B, 0);
+            if (n_spec > 0)
+                mtp_forward_batch(&model, pool, &prompt_tokens[pos], pos, B, 0);
+            pos += B;
+            lastB = B;
         }
+        /* logits du dernier token de prompt (sampler / 1er cycle spéculatif) */
+        if (lastB > 0)
+            memcpy(model.logits,
+                   model.logits_b + (size_t)(lastB - 1) * model.cfg.vocab_size,
+                   (size_t)model.cfg.vocab_size * sizeof(float));
     }
     double t_prefill = get_time_sec() - t_prefill_start;
 
@@ -174,7 +186,7 @@ int main(int argc, char **argv) {
             const uint32_t B = k + 1;
 
             /* Batched verification: single pass over model weights */
-            model_forward_batch(&model, pool, cand, P + 1, B);
+            model_forward_batch(&model, pool, cand, P + 1, B, 1);
 
             /* j = first mismatch index (all accepted if j == k) */
             uint32_t j = k;
