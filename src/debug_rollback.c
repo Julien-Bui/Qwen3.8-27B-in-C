@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
 
     /* batch 1 : [" Paris", ".", "<|im_end|>] @ 5..7, accepte j=1 */
     uint32_t cand1[3] = {11751, 13, 248046};
-    model_forward_batch(&mx, pool, cand1, 5, 3);
+    model_forward_batch(&mx, pool, cand1, 5, 3, 1);
     model_rollback_to(&mx, 1);
     mx.pos = 5 + 1 + 2;   /* = 7 */
 
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
 
     /* batch 2 sur l'etat rollbacke : ["\n", "The", " capital"] @ 7..9 */
     uint32_t cand2[3] = {198, 760, 6511};
-    model_forward_batch(&mx, pool, cand2, 7, 3);
+    model_forward_batch(&mx, pool, cand2, 7, 3, 1);
 
     /* reference : logits sauvegardes apres CHAQUE token */
     static float ref_logits[2][248320];

@@ -110,7 +110,8 @@ typedef struct {
     uint32_t pos;
 } qwen_model_t;
 
-#define SPEC_MAX_B 3   /* k = SPEC_MAX_B - 1 drafts */
+#define SPEC_MAX_B 3     /* k = SPEC_MAX_B - 1 drafts (speculative verification) */
+#define PREFILL_MAX_B 8  /* max tokens per batched prefill chunk */
 
 /* Model initialization and destruction */
 int  model_init(qwen_model_t *m, const char *path, uint32_t n_ctx);
@@ -123,9 +124,11 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool);
 /* Full single-token forward pass */
 void model_forward(qwen_model_t *m, pool_t *pool, uint32_t token, uint32_t pos);
 
-/* Batched forward pass for speculative verification */
+/* Batched forward pass (speculative verification or prefill chunks).
+ * ckpt: save per-token recurrent state checkpoints (needed for rollback,
+ *       i.e. speculative verification; set 0 for prefill). */
 void model_forward_batch(qwen_model_t *m, pool_t *pool,
-                         const uint32_t *tokens, uint32_t pos, uint32_t B);
+                         const uint32_t *tokens, uint32_t pos, uint32_t B, int ckpt);
 
 /* Recurrent state snapshot and rollback */
 int  model_snapshot_states(qwen_model_t *m);
@@ -135,6 +138,11 @@ void model_rollback_to(qwen_model_t *m, uint32_t b);
 /* MTP Multi-Token Prediction layer forward pass */
 int mtp_forward(qwen_model_t *m, pool_t *pool, uint32_t token, uint32_t pos,
                 int want_logits);
+
+/* Batched MTP forward pass (prefill): fills the MTP KV cache for
+ * tokens[pos..pos+B-1]; mtp_h anchors on the last token's output. */
+int mtp_forward_batch(qwen_model_t *m, pool_t *pool, const uint32_t *tokens,
+                      uint32_t pos, uint32_t B, int want_logits);
 
 /* Greedy argmax */
 uint32_t model_sample_greedy(const float *logits, uint32_t vocab_size);

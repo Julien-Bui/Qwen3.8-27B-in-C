@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
     }
 
     /* verification batch */
-    model_forward_batch(&model, pool, cand, P + 1, 3);
+    model_forward_batch(&model, pool, cand, P + 1, 3, 1);
     for (uint32_t i = 0; i < 3; i++) {
         uint32_t v = model_sample_greedy(model.logits_b + (size_t)i * model.cfg.vocab_size,
                                          model.cfg.vocab_size);

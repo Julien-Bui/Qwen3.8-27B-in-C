@@ -200,9 +200,10 @@ int model_init(qwen_model_t *m, const char *path, uint32_t n_ctx) {
         }
     }
 
-    /* ---- Speculative decoding batch buffers ---- */
+    /* ---- Batch buffers: speculative verification (B <= SPEC_MAX_B)
+     *      and batched prefill chunks (B <= PREFILL_MAX_B) ---- */
     {
-        const size_t B = SPEC_MAX_B;
+        const size_t B = PREFILL_MAX_B;   /* >= SPEC_MAX_B */
         const size_t stride_qkv = d->n_ff;   /* max(12288, 10240, 17408) = n_ff */
         const size_t floats =
             B * d->n_embd        /* bx */
@@ -731,7 +732,8 @@ static void attention_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool
                               _mm256_loadu_ps(m->bxb + b * n_embd + i)));
 }
 
-static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t B) {
+static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
+                            uint32_t B, int ckpt) {
     const qwen_dims_t *d = &m->dims;
     const float eps = m->cfg.rms_norm_eps;
     const uint32_t n_embd = d->n_embd;
@@ -750,9 +752,16 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
     gemv_batch(pool, L->wqkv, m->bxb, n_embd, B, m->bqkv, stride);
 
     /* conv1d causale : sequentielle sur le batch (l'etat glisse).
-     * Checkpoint conv APRES chaque token (l'etat avance dans cette boucle). */
+     * Checkpoints conv/SSM uniquement en mode verification speculative :
+     * index de cette couche parmi les recurrentes + offsets dans ckpt_*.
+     * n_ckpt borne le nombre de checkpoints a la capacite des buffers
+     * (SPEC_MAX_B - 1 slots) meme si B > SPEC_MAX_B. */
     const float *conv_w = (const float *)L->ssm_conv1d->data;
-    {
+    const size_t conv_elems = (size_t)conv_dim * d->d_conv;
+    const size_t ssm_elems  = (size_t)n_v_heads * head_v_dim * head_k_dim;
+    const uint32_t n_ckpt = (B < SPEC_MAX_B) ? B : SPEC_MAX_B;
+    size_t layer_off_conv = 0, layer_off_ssm = 0;
+    if (ckpt) {
         uint32_t ir = 0;
         for (uint32_t i = 0; i < d->n_layer; i++) {
             if (m->layers[i].is_recurrent) {
@@ -760,9 +769,11 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
                 ir++;
             }
         }
-        const size_t conv_elems = (size_t)conv_dim * d->d_conv;
-        const size_t layer_off_conv = (size_t)ir * conv_elems;
+        layer_off_conv = (size_t)ir * conv_elems;
+        layer_off_ssm  = (size_t)ir * ssm_elems;
+    }
 
+    {
         for (uint32_t b = 0; b < B; b++) {
             float *xb_qkv = m->bqkv + b * stride;
             for (uint32_t c = 0; c < conv_dim; c++) {
@@ -775,7 +786,7 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
                 xb_qkv[c] = c_state[0] * cw[0] + c_state[1] * cw[1]
                           + c_state[2] * cw[2] + c_state[3] * cw[3];
             }
-            if (b + 1 < B) {
+            if (ckpt && b + 1 < n_ckpt) {
                 memcpy(m->ckpt_conv + (size_t)b * m->dims.n_recr_layer * conv_elems
                          + layer_off_conv,
                        L->conv_state, conv_elems * sizeof(float));
@@ -793,7 +804,7 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
 
     gemv_batch(pool, L->wqkv_gate, m->bxb, n_embd, B, m->bz, d_inner);
 
-    float beta_b[SPEC_MAX_B][256], alpha_b[SPEC_MAX_B][256];
+    float beta_b[PREFILL_MAX_B][256], alpha_b[PREFILL_MAX_B][256];
     gemv_batch(pool, L->ssm_beta, m->bxb, n_embd, B, &beta_b[0][0], 256);
     gemv_batch(pool, L->ssm_alpha, m->bxb, n_embd, B, &alpha_b[0][0], 256);
 
@@ -801,21 +812,10 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
     const float *ssm_a = (const float *)L->ssm_a->data;
     const float q_scale = 1.0f / sqrtf((float)head_k_dim);
 
-    /* recurrence SSM : sequentielle sur le batch, b-EXTERIEUR (l'etat
-     * "apres le token b" pour la couche n'existe qu'une fois toutes les
-     * tetes a jour -> checkpoint possible apres chaque token) */
+    /* recurrence SSM : sequentielle sur le batch (l'etat "apres le token b"
+     * pour la couche n'existe qu'une fois toutes les tetes a jour -> checkpoint
+     * apres chaque token, en mode verification speculative uniquement) */
     {
-        /* index de cette couche parmi les recurrentes (pour le checkpoint) */
-        uint32_t ir = 0;
-        for (uint32_t i = 0; i < d->n_layer; i++) {
-            if (m->layers[i].is_recurrent) {
-                if (&m->layers[i] == L) break;
-                ir++;
-            }
-        }
-        const size_t ssm_elems = (size_t)n_v_heads * head_v_dim * head_k_dim;
-        const size_t layer_off_ssm = (size_t)ir * ssm_elems;
-
         for (uint32_t b = 0; b < B; b++) {
             for (uint32_t h = 0; h < n_v_heads; h++) {
                 const uint32_t kh = h % n_k_heads;
@@ -863,7 +863,7 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
 
             /* checkpoint SSM apres le token b (sauf le dernier) ;
              * conv deja checkpointe dans sa propre boucle */
-            if (b + 1 < B) {
+            if (ckpt && b + 1 < n_ckpt) {
                 memcpy(m->ckpt_ssm + (size_t)b * m->dims.n_recr_layer * ssm_elems
                          + layer_off_ssm,
                        L->ssm_state, ssm_elems * sizeof(float));
@@ -916,7 +916,7 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint
 }
 
 void model_forward_batch(qwen_model_t *m, pool_t *pool,
-                         const uint32_t *tokens, uint32_t pos, uint32_t B) {
+                         const uint32_t *tokens, uint32_t pos, uint32_t B, int ckpt) {
     const qwen_dims_t *d = &m->dims;
     const float eps = m->cfg.rms_norm_eps;
 
@@ -927,7 +927,7 @@ void model_forward_batch(qwen_model_t *m, pool_t *pool,
     for (uint32_t il = 0; il < d->n_layer; il++) {
         qwen_layer_t *L = &m->layers[il];
         if (L->is_recurrent)
-            gdn_layer_batch(m, L, pool, B);
+            gdn_layer_batch(m, L, pool, B, ckpt);
         else
             attention_layer_batch(m, L, pool, pos, B);
     }
@@ -1000,6 +1000,46 @@ int mtp_forward(qwen_model_t *m, pool_t *pool, uint32_t token, uint32_t pos,
     if (want_logits) {
         rmsnorm(m->xb, m->x, (const float *)m->mtp_shnorm->data, n_embd, eps);
         gemv(pool, m->output, m->xb, m->logits);
+    }
+    return 0;
+}
+
+/* MTP batche (prefill) : remplit le KV cache MTP pour tokens[pos..pos+B-1].
+ * Entree h par token = h_save[b] (etat cache du backbone AVANT output_norm,
+ * rempli par model_forward_batch) ; l'ancre mtp_h = sortie du DERNIER token.
+ * Semantique identique a n appels a mtp_forward(..., want_logits=0). */
+int mtp_forward_batch(qwen_model_t *m, pool_t *pool, const uint32_t *tokens,
+                      uint32_t pos, uint32_t B, int want_logits) {
+    const qwen_dims_t *d = &m->dims;
+    const float eps = m->cfg.rms_norm_eps;
+    const uint32_t n_embd = d->n_embd;
+    const uint32_t stride = d->n_ff;   /* stride bqkv >= 2*n_embd */
+
+    /* concat [e_norm || h_norm] par token dans bqkv[b*stride] */
+    for (uint32_t b = 0; b < B; b++) {
+        float *cat = m->bqkv + (size_t)b * stride;
+        dequant_row(m->tok_embd->type, quant_row_ptr(m->tok_embd, tokens[b]),
+                    n_embd, cat);
+        rmsnorm(cat, cat, (const float *)m->mtp_enorm->data, n_embd, eps);
+        rmsnorm(cat + n_embd, m->h_save + (size_t)b * n_embd,
+                (const float *)m->mtp_hnorm->data, n_embd, eps);
+    }
+
+    /* bx = eh_proj @ concat (residu d'entree de la couche MTP) */
+    gemv_batch(pool, m->mtp_eh_proj, m->bqkv, stride, B, m->bx, n_embd);
+
+    /* couche d'attention gatee batchee (KV cache MTP dedie, FFN inclus) */
+    attention_layer_batch(m, &m->mtp_layer, pool, pos, B);
+
+    /* h_nextn : ancre = sortie du dernier token du chunk */
+    memcpy(m->mtp_h, m->bx + (size_t)(B - 1) * n_embd, n_embd * sizeof(float));
+
+    if (want_logits) {
+        for (uint32_t b = 0; b < B; b++)
+            rmsnorm(m->bxb + (size_t)b * n_embd, m->bx + (size_t)b * n_embd,
+                    (const float *)m->mtp_shnorm->data, n_embd, eps);
+        gemv_batch(pool, m->output, m->bxb, n_embd, B, m->logits_b,
+                   m->cfg.vocab_size);
     }
     return 0;
 }

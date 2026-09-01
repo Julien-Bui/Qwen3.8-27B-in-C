@@ -31,10 +31,10 @@ int main(int argc, char **argv) {
     toks[7] = 488;     /* you */
     uint32_t B = 3;
     if (argc > 2) B = (uint32_t)atoi(argv[2]);
-    if (B > SPEC_MAX_B) B = SPEC_MAX_B;
+    if (B > PREFILL_MAX_B) B = PREFILL_MAX_B;
 
     /* passe sequentielle en sauvegardant les logits a chaque pas */
-    static float seq_logits[SPEC_MAX_B][248320];
+    static float seq_logits[PREFILL_MAX_B][248320];
     for (uint32_t i = 0; i < B; i++) {
         model_forward(&ma, pool, toks[i], i);
         memcpy(seq_logits[i], ma.logits, 248320 * sizeof(float));
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
 
     /* batch */
     double t0 = now_sec();
-    model_forward_batch(&mb, pool, toks, 0, B);
+    model_forward_batch(&mb, pool, toks, 0, B, 1);
     double dt_batch = now_sec() - t0;
 
     /* comparaison */
@@ -66,8 +66,8 @@ int main(int argc, char **argv) {
         printf("token %u : argmax seq=%u batch=%u %s  max_abs=%.3e\n", b, gseq, gbat,
                gseq == gbat ? "OK" : "DIFF", tmax);
     }
-    printf("\nmax_abs=%.3e (token %u)  max_rel=%.3e  argmax_diff=%d/4\n",
-           max_abs, worst_b, max_rel, n_diff_top);
+    printf("\nmax_abs=%.3e (token %u)  max_rel=%.3e  argmax_diff=%d/%u\n",
+           max_abs, worst_b, max_rel, n_diff_top, B);
     printf("forward_batch(%u tokens) : %.0f ms (%.2f ms/token)\n",
            B, dt_batch * 1e3, dt_batch * 1e3 / B);
 

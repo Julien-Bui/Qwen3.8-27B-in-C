@@ -16,7 +16,7 @@ static void run_cycle(qwen_model_t *m, pool_t *pool, tokenizer_t *tok,
         mtp_forward(m, pool, cand[s - 1], P + s, 1);
         cand[s] = model_sample_greedy(m->logits, m->cfg.vocab_size);
     }
-    model_forward_batch(m, pool, cand, P + 1, n_spec + 1);
+    model_forward_batch(m, pool, cand, P + 1, n_spec + 1, 1);
     uint32_t j = n_spec;
     for (uint32_t i = 0; i < n_spec; i++) {
         uint32_t v = model_sample_greedy(m->logits_b + (size_t)i * m->cfg.vocab_size, m->cfg.vocab_size);
