@@ -429,6 +429,136 @@ void attention_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t po
     }
 }
 
+/* ======== Recurrence SSM (GDN) : parallelisee sur les tetes v ========
+ * Les 48 tetes v d'une couche GDN ont des etats S independants : la boucle
+ * est partitionnee sur le pool. En mode batch, chaque thread possede une
+ * tranche de tetes et deroule les B tokens sequentiellement (une seule
+ * barriere par couche au lieu de B, et S reste chaud en cache L1/L2).
+ * Operations identiques a l'implementation mono-thread d'origine. */
+
+static void gdn_ssm_head(float *S, const float *qh, const float *k_vec,
+                         const float *v_vec, float b_val, float decay,
+                         float kq, float q_scale, float *out_h,
+                         uint32_t head_k_dim, uint32_t head_v_dim) {
+    /* Fusion exacte des 4 balayages de S en 2 passes par ligne :
+     *   delta_j = decay * (S_j . k) ; d_j = (v_j - delta_j) * beta
+     *   S'_j    = decay * S_j + k * d_j
+     *   o_j     = decay * (S_j . q) + d_j * (k . q)  */
+    for (uint32_t j = 0; j < head_k_dim; j++) {
+        const float *row = S + (size_t)j * head_v_dim;
+        __m256 acc_k = _mm256_setzero_ps();
+        __m256 acc_q = _mm256_setzero_ps();
+        for (uint32_t i = 0; i < head_v_dim; i += 8) {
+            __m256 srow = _mm256_loadu_ps(row + i);
+            acc_k = _mm256_fmadd_ps(srow, _mm256_loadu_ps(k_vec + i), acc_k);
+            acc_q = _mm256_fmadd_ps(srow, _mm256_loadu_ps(qh + i), acc_q);
+        }
+        float delta = decay * hsum256(acc_k);
+        float d_j = (v_vec[j] - delta) * b_val;
+        out_h[j] = (decay * hsum256(acc_q) + d_j * kq) * q_scale;
+
+        float *row_w = S + (size_t)j * head_v_dim;
+        __m256 vdj = _mm256_set1_ps(d_j);
+        __m256 vdec = _mm256_set1_ps(decay);
+        for (uint32_t i = 0; i < head_v_dim; i += 8) {
+            __m256 srow = _mm256_loadu_ps(row_w + i);
+            srow = _mm256_fmadd_ps(vdj, _mm256_loadu_ps(k_vec + i), _mm256_mul_ps(vdec, srow));
+            _mm256_storeu_ps(row_w + i, srow);
+        }
+    }
+}
+
+typedef struct {
+    qwen_model_t *m;
+    qwen_layer_t *L;
+    const float  *qkv;     /* [B][ldx] : Q | K | V concat par token */
+    uint64_t      ldx;
+    const float  *beta;    /* [B][256] (stride 256) */
+    const float  *alpha;   /* [B][256] */
+    float        *out;     /* [B][out_stride] */
+    uint64_t      out_stride;
+    uint32_t      B;
+    uint32_t      n_ckpt;  /* 0 = sans checkpoint (prefill / mono-token) */
+    uint32_t      ir;      /* index de la couche parmi les recurrentes */
+} gdn_ssm_job_t;
+
+static void gdn_ssm_chunk(void *arg, int tid, int ntid) {
+    gdn_ssm_job_t *j = arg;
+    const qwen_dims_t *d = &j->m->dims;
+    const qwen_layer_t *L = j->L;
+    const uint32_t n_v_heads = d->n_v_heads;
+    const uint32_t n_k_heads = d->n_k_heads;
+    const uint32_t head_k_dim = d->head_k_dim;
+    const uint32_t head_v_dim = d->head_v_dim;
+    const float *dt_bias = (const float *)L->ssm_dt_bias->data;
+    const float *ssm_a = (const float *)L->ssm_a->data;
+    const float q_scale = 1.0f / sqrtf((float)head_k_dim);
+    const uint32_t h0 = (uint32_t)((uint64_t)n_v_heads * (uint32_t)tid / (uint32_t)ntid);
+    const uint32_t h1 = (uint32_t)((uint64_t)n_v_heads * (uint32_t)(tid + 1) / (uint32_t)ntid);
+    const size_t head_elems = (size_t)head_v_dim * head_k_dim;
+    const size_t ssm_elems = (size_t)n_v_heads * head_elems;
+    const size_t layer_off = (size_t)j->ir * ssm_elems + (size_t)h0 * head_elems;
+    const size_t ckpt_stride = (size_t)d->n_recr_layer * ssm_elems;
+
+    for (uint32_t b = 0; b < j->B; b++) {
+        const float *xb_qkv = j->qkv + (size_t)b * j->ldx;
+        const float *beta_b = j->beta + (size_t)b * 256;
+        const float *alpha_b = j->alpha + (size_t)b * 256;
+        float *out_base = j->out + (size_t)b * j->out_stride;
+
+        for (uint32_t h = h0; h < h1; h++) {
+            const uint32_t kh = h % n_k_heads;
+            const float *qh = xb_qkv + kh * head_k_dim;
+            const float *k_vec = xb_qkv + n_k_heads * head_k_dim + kh * head_k_dim;
+            const float *v_vec = xb_qkv + 2 * n_k_heads * head_k_dim + h * head_v_dim;
+            float *S = L->ssm_state + (size_t)h * head_elems;
+            float *out_h = out_base + h * head_v_dim;
+
+            float b_val = 1.0f / (1.0f + expf(-beta_b[h]));
+            float a_raw = alpha_b[h] + dt_bias[h];
+            float a_sp = (a_raw > 30.0f) ? a_raw : log1pf(expf(a_raw));
+            float decay = expf(ssm_a[h] * a_sp);
+
+            /* k.q : constant par tete (pour la sortie algebrique) */
+            __m256 kq_acc = _mm256_setzero_ps();
+            for (uint32_t i = 0; i < head_k_dim; i += 8) {
+                kq_acc = _mm256_fmadd_ps(_mm256_loadu_ps(k_vec + i), _mm256_loadu_ps(qh + i), kq_acc);
+            }
+            const float kq = hsum256(kq_acc);
+
+            gdn_ssm_head(S, qh, k_vec, v_vec, b_val, decay, kq, q_scale,
+                         out_h, head_k_dim, head_v_dim);
+        }
+
+        /* checkpoint apres le token b : tranche de tetes [h0, h1) uniquement
+         * (tranches disjointes par thread -> pas de synchronisation) */
+        if (b + 1 < j->n_ckpt)
+            memcpy(j->m->ckpt_ssm + (size_t)b * ckpt_stride + layer_off,
+                   L->ssm_state + (size_t)h0 * head_elems,
+                   (size_t)(h1 - h0) * head_elems * sizeof(float));
+    }
+}
+
+static void gdn_ssm_run(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
+                        const float *qkv, uint64_t ldx,
+                        const float *beta, const float *alpha,
+                        float *out, uint64_t out_stride,
+                        uint32_t B, uint32_t n_ckpt) {
+    uint32_t ir = 0;
+    for (uint32_t i = 0; i < m->dims.n_layer; i++) {
+        if (m->layers[i].is_recurrent) {
+            if (&m->layers[i] == L) break;
+            ir++;
+        }
+    }
+    gdn_ssm_job_t job = { m, L, qkv, ldx, beta, alpha, out, out_stride,
+                          B, n_ckpt, ir };
+    if (pool)
+        pool_run(pool, gdn_ssm_chunk, &job);
+    else
+        gdn_ssm_chunk(&job, 0, 1);
+}
+
 void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
     const qwen_dims_t *d = &m->dims;
     const float eps = m->cfg.rms_norm_eps;
@@ -458,7 +588,6 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
 
     float *Q = m->qkv;
     float *K = m->qkv + n_k_heads * head_k_dim;
-    float *V = m->qkv + 2 * n_k_heads * head_k_dim;
 
     for (uint32_t kh = 0; kh < n_k_heads; kh++) {
         l2norm(Q + kh * head_k_dim, Q + kh * head_k_dim, head_k_dim, eps);
@@ -471,58 +600,9 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
     gemv(pool, L->ssm_beta, m->xb, beta);
     gemv(pool, L->ssm_alpha, m->xb, alpha);
 
-    const float *dt_bias = (const float *)L->ssm_dt_bias->data;
-    const float *ssm_a = (const float *)L->ssm_a->data;
-    const float q_scale = 1.0f / sqrtf((float)head_k_dim);
-
-    for (uint32_t h = 0; h < n_v_heads; h++) {
-        const uint32_t kh = h % n_k_heads;
-        const float *qh = Q + kh * head_k_dim;
-        const float *k_vec = K + kh * head_k_dim;
-        const float *v_vec = V + h * head_v_dim;
-        float *S = L->ssm_state + (size_t)h * (head_v_dim * head_k_dim);
-        float *out_h = m->attn_out + h * head_v_dim;
-
-        float b_val = 1.0f / (1.0f + expf(-beta[h]));
-        float a_sp = (alpha[h] + dt_bias[h] > 30.0f) ? (alpha[h] + dt_bias[h]) : log1pf(expf(alpha[h] + dt_bias[h]));
-        float decay = expf(ssm_a[h] * a_sp);
-
-        /* k.q : constant par tete (pour la sortie algebrique) */
-        __m256 kq_acc = _mm256_setzero_ps();
-        for (uint32_t i = 0; i < head_k_dim; i += 8) {
-            kq_acc = _mm256_fmadd_ps(_mm256_loadu_ps(k_vec + i), _mm256_loadu_ps(qh + i), kq_acc);
-        }
-        const float kq = hsum256(kq_acc);
-
-        /* Fusion exacte des 4 balayages de S en 2 passes par ligne :
-         *   delta_j = decay * (S_j . k)
-         *   d_j     = (v_j - delta_j) * beta
-         *   S'_j    = decay * S_j + k * d_j
-         *   o_j     = decay * (S_j . q) + d_j * (k . q)
-         * Passe 1 : les deux dots par ligne ; passe 2 : ecriture de S'. */
-        for (uint32_t j = 0; j < head_k_dim; j++) {
-            const float *row = S + (size_t)j * head_v_dim;
-            __m256 acc_k = _mm256_setzero_ps();
-            __m256 acc_q = _mm256_setzero_ps();
-            for (uint32_t i = 0; i < head_v_dim; i += 8) {
-                __m256 srow = _mm256_loadu_ps(row + i);
-                acc_k = _mm256_fmadd_ps(srow, _mm256_loadu_ps(k_vec + i), acc_k);
-                acc_q = _mm256_fmadd_ps(srow, _mm256_loadu_ps(qh + i), acc_q);
-            }
-            float delta = decay * hsum256(acc_k);
-            float d_j = (v_vec[j] - delta) * b_val;
-            out_h[j] = (decay * hsum256(acc_q) + d_j * kq) * q_scale;
-
-            float *row_w = S + (size_t)j * head_v_dim;
-            __m256 vdj = _mm256_set1_ps(d_j);
-            __m256 vdec = _mm256_set1_ps(decay);
-            for (uint32_t i = 0; i < head_v_dim; i += 8) {
-                __m256 srow = _mm256_loadu_ps(row_w + i);
-                srow = _mm256_fmadd_ps(vdj, _mm256_loadu_ps(k_vec + i), _mm256_mul_ps(vdec, srow));
-                _mm256_storeu_ps(row_w + i, srow);
-            }
-        }
-    }
+    /* Recurrence SSM parallelisee sur les tetes v (etats independants) */
+    gdn_ssm_run(m, L, pool, m->qkv, conv_dim, beta, alpha,
+                m->attn_out, d_inner, 1, 0);
 
     const float *ssm_norm_w = (const float *)L->ssm_norm->data;
     silu_inplace(m->z, d_inner);
@@ -752,15 +832,13 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
     gemv_batch(pool, L->wqkv, m->bxb, n_embd, B, m->bqkv, stride);
 
     /* conv1d causale : sequentielle sur le batch (l'etat glisse).
-     * Checkpoints conv/SSM uniquement en mode verification speculative :
-     * index de cette couche parmi les recurrentes + offsets dans ckpt_*.
-     * n_ckpt borne le nombre de checkpoints a la capacite des buffers
-     * (SPEC_MAX_B - 1 slots) meme si B > SPEC_MAX_B. */
+     * Checkpoint conv uniquement en mode verification speculative (le
+     * checkpoint SSM est gere par gdn_ssm_run). n_ckpt borne le nombre de
+     * checkpoints a la capacite des buffers (SPEC_MAX_B - 1 slots). */
     const float *conv_w = (const float *)L->ssm_conv1d->data;
     const size_t conv_elems = (size_t)conv_dim * d->d_conv;
-    const size_t ssm_elems  = (size_t)n_v_heads * head_v_dim * head_k_dim;
     const uint32_t n_ckpt = (B < SPEC_MAX_B) ? B : SPEC_MAX_B;
-    size_t layer_off_conv = 0, layer_off_ssm = 0;
+    size_t layer_off_conv = 0;
     if (ckpt) {
         uint32_t ir = 0;
         for (uint32_t i = 0; i < d->n_layer; i++) {
@@ -770,7 +848,6 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
             }
         }
         layer_off_conv = (size_t)ir * conv_elems;
-        layer_off_ssm  = (size_t)ir * ssm_elems;
     }
 
     {
@@ -808,68 +885,12 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
     gemv_batch(pool, L->ssm_beta, m->bxb, n_embd, B, &beta_b[0][0], 256);
     gemv_batch(pool, L->ssm_alpha, m->bxb, n_embd, B, &alpha_b[0][0], 256);
 
-    const float *dt_bias = (const float *)L->ssm_dt_bias->data;
-    const float *ssm_a = (const float *)L->ssm_a->data;
-    const float q_scale = 1.0f / sqrtf((float)head_k_dim);
-
-    /* recurrence SSM : sequentielle sur le batch (l'etat "apres le token b"
-     * pour la couche n'existe qu'une fois toutes les tetes a jour -> checkpoint
-     * apres chaque token, en mode verification speculative uniquement) */
-    {
-        for (uint32_t b = 0; b < B; b++) {
-            for (uint32_t h = 0; h < n_v_heads; h++) {
-                const uint32_t kh = h % n_k_heads;
-                float *S = L->ssm_state + (size_t)h * (head_v_dim * head_k_dim);
-                const float *xb_qkv = m->bqkv + b * stride;
-                const float *qh = xb_qkv + kh * head_k_dim;
-                const float *k_vec = xb_qkv + n_k_heads * head_k_dim + kh * head_k_dim;
-                const float *v_vec = xb_qkv + 2 * n_k_heads * head_k_dim + h * head_v_dim;
-                float *out_h = m->battn_out + b * d_inner + h * head_v_dim;
-
-                float b_val = 1.0f / (1.0f + expf(-beta_b[b][h]));
-                float a_raw = alpha_b[b][h] + dt_bias[h];
-                float a_sp = (a_raw > 30.0f) ? a_raw : log1pf(expf(a_raw));
-                float decay = expf(ssm_a[h] * a_sp);
-
-                __m256 kq_acc = _mm256_setzero_ps();
-                for (uint32_t i = 0; i < head_k_dim; i += 8) {
-                    kq_acc = _mm256_fmadd_ps(_mm256_loadu_ps(k_vec + i), _mm256_loadu_ps(qh + i), kq_acc);
-                }
-                const float kq = hsum256(kq_acc);
-
-                for (uint32_t j = 0; j < head_k_dim; j++) {
-                    const float *row = S + (size_t)j * head_v_dim;
-                    __m256 acc_k = _mm256_setzero_ps();
-                    __m256 acc_q = _mm256_setzero_ps();
-                    for (uint32_t i = 0; i < head_v_dim; i += 8) {
-                        __m256 srow = _mm256_loadu_ps(row + i);
-                        acc_k = _mm256_fmadd_ps(srow, _mm256_loadu_ps(k_vec + i), acc_k);
-                        acc_q = _mm256_fmadd_ps(srow, _mm256_loadu_ps(qh + i), acc_q);
-                    }
-                    float delta = decay * hsum256(acc_k);
-                    float d_j = (v_vec[j] - delta) * b_val;
-                    out_h[j] = (decay * hsum256(acc_q) + d_j * kq) * q_scale;
-
-                    float *row_w = S + (size_t)j * head_v_dim;
-                    __m256 vdj = _mm256_set1_ps(d_j);
-                    __m256 vdec = _mm256_set1_ps(decay);
-                    for (uint32_t i = 0; i < head_v_dim; i += 8) {
-                        __m256 srow = _mm256_loadu_ps(row_w + i);
-                        srow = _mm256_fmadd_ps(vdj, _mm256_loadu_ps(k_vec + i), _mm256_mul_ps(vdec, srow));
-                        _mm256_storeu_ps(row_w + i, srow);
-                    }
-                }
-            }
-
-            /* checkpoint SSM apres le token b (sauf le dernier) ;
-             * conv deja checkpointe dans sa propre boucle */
-            if (ckpt && b + 1 < n_ckpt) {
-                memcpy(m->ckpt_ssm + (size_t)b * m->dims.n_recr_layer * ssm_elems
-                         + layer_off_ssm,
-                       L->ssm_state, ssm_elems * sizeof(float));
-            }
-        }
-    }
+    /* Recurrence SSM parallelisee : chaque thread possede une tranche de
+     * tetes v et deroule les B tokens sequentiellement (une seule barriere
+     * par couche, etats S chauds en cache). Checkpoints : chaque thread
+     * ecrit sa tranche apres chaque token (offsets disjoints). */
+    gdn_ssm_run(m, L, pool, m->bqkv, stride, &beta_b[0][0], &alpha_b[0][0],
+                m->battn_out, d_inner, B, ckpt ? n_ckpt : 0);
 
     const float *ssm_norm_w = (const float *)L->ssm_norm->data;
     for (uint32_t b = 0; b < B; b++)
