@@ -77,7 +77,7 @@ typedef struct {
     float *ffn_buf;  /* silu(gate)*up [n_ff] */
     float *attn_out; /* [n_head*head_dim] */
     float *logits;   /* [vocab_size] */
-    float *scores;   /* [n_ctx] for attention softmax */
+    float *scores;   /* [n_head][n_ctx] per-head attention scores (parallel heads) */
 
     /* Precomputed RoPE tables: [n_ctx][rope_dims/2] */
     float *rope_cos, *rope_sin;

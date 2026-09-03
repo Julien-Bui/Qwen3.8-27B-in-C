@@ -166,7 +166,7 @@ int model_init(qwen_model_t *m, const char *path, uint32_t n_ctx) {
     size_t stride_qkv = d->conv_dim;
     if (2 * d->n_head * d->head_dim > stride_qkv) stride_qkv = 2 * d->n_head * d->head_dim;
     if (d->n_ff > stride_qkv) stride_qkv = d->n_ff;
-    const size_t floats = d->n_embd + d->n_embd + stride_qkv + 2 * d->n_kv_head * d->head_dim + d->d_inner + d->n_ff + d->n_head * d->head_dim + (size_t)c->vocab_size + (size_t)n_ctx;
+    const size_t floats = d->n_embd + d->n_embd + stride_qkv + 2 * d->n_kv_head * d->head_dim + d->d_inner + d->n_ff + d->n_head * d->head_dim + (size_t)c->vocab_size + (size_t)d->n_head * n_ctx;
     m->arena = alloc64(floats * sizeof(float));
     if (!m->arena) goto fail;
     {
@@ -332,6 +332,89 @@ static void apply_rope(float *vec, uint32_t pos, const qwen_model_t *m) {
     }
 }
 
+/* ======== Attention : tetes paralleles ========
+ * Les 24 tetes q d'une couche d'attention sont independantes (elles partagent
+ * le KV cache en lecture seule) : la boucle scores/softmax/V-accumulation/
+ * gating est partitionnee sur le pool. Chaque tete dispose de sa ligne de
+ * scores dediee (m->scores[h][n_ctx]) -> aucune ecriture partagee.
+ * Operations identiques a l'implementation mono-thread d'origine. */
+
+typedef struct {
+    qwen_model_t *m;
+    qwen_layer_t *L;
+    float        *qkv;         /* [B][ldx] : [q | gate] par tete */
+    uint64_t      ldx;
+    float        *out;         /* [B][out_stride] */
+    uint64_t      out_stride;
+    uint32_t      pos;         /* position du token 0 du batch */
+    uint32_t      B;
+} attn_heads_job_t;
+
+static void attn_heads_chunk(void *arg, int tid, int ntid) {
+    attn_heads_job_t *j = arg;
+    const qwen_dims_t *d = &j->m->dims;
+    const uint32_t head_dim = d->head_dim;
+    const uint32_t n_head = d->n_head;
+    const uint32_t n_kv_head = d->n_kv_head;
+    const float scale_attn = 1.0f / sqrtf((float)head_dim);
+    const uint32_t heads_per_kv = n_head / n_kv_head;
+    const uint32_t h0 = (uint32_t)((uint64_t)n_head * (uint32_t)tid / (uint32_t)ntid);
+    const uint32_t h1 = (uint32_t)((uint64_t)n_head * (uint32_t)(tid + 1) / (uint32_t)ntid);
+    const uint32_t kvrow = n_kv_head * head_dim;
+
+    for (uint32_t h = h0; h < h1; h++) {
+        const uint32_t kh = h / heads_per_kv;
+        float *scores_h = j->m->scores + (size_t)h * j->m->n_ctx;
+
+        for (uint32_t b = 0; b < j->B; b++) {
+            float *qh = j->qkv + (size_t)b * j->ldx + h * (2 * head_dim);
+            float *gate_h = qh + head_dim;
+            float *out_h = j->out + (size_t)b * j->out_stride + h * head_dim;
+            const uint32_t pl = j->pos + b;
+
+            for (uint32_t t = 0; t <= pl; t++) {
+                const float *kt = j->L->kv_k + (size_t)t * kvrow + kh * head_dim;
+                __m256 acc = _mm256_setzero_ps();
+                for (uint32_t i = 0; i < head_dim; i += 8) {
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i), _mm256_loadu_ps(kt + i), acc);
+                }
+                scores_h[t] = hsum256(acc) * scale_attn;
+            }
+
+            softmax_inplace(scores_h, pl + 1);
+
+            memset(out_h, 0, head_dim * sizeof(float));
+            for (uint32_t t = 0; t <= pl; t++) {
+                const float st = scores_h[t];
+                const float *vt = j->L->kv_v + (size_t)t * kvrow + kh * head_dim;
+                __m256 vst = _mm256_set1_ps(st);
+                for (uint32_t i = 0; i < head_dim; i += 8) {
+                    __m256 vout = _mm256_loadu_ps(out_h + i);
+                    __m256 vval = _mm256_loadu_ps(vt + i);
+                    _mm256_storeu_ps(out_h + i, _mm256_fmadd_ps(vst, vval, vout));
+                }
+            }
+
+            sigmoid_inplace(gate_h, head_dim);
+            for (uint32_t i = 0; i < head_dim; i += 8) {
+                __m256 vo = _mm256_loadu_ps(out_h + i);
+                __m256 vg = _mm256_loadu_ps(gate_h + i);
+                _mm256_storeu_ps(out_h + i, _mm256_mul_ps(vo, vg));
+            }
+        }
+    }
+}
+
+static void attn_heads_run(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
+                           float *qkv, uint64_t ldx, float *out,
+                           uint64_t out_stride, uint32_t pos, uint32_t B) {
+    attn_heads_job_t job = { m, L, qkv, ldx, out, out_stride, pos, B };
+    if (pool)
+        pool_run(pool, attn_heads_chunk, &job);
+    else
+        attn_heads_chunk(&job, 0, 1);
+}
+
 void attention_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t pos) {
     const qwen_dims_t *d = &m->dims;
     const float eps = m->cfg.rms_norm_eps;
@@ -371,44 +454,9 @@ void attention_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t po
         apply_rope(kh_ptr, pos, m);
     }
 
-    const float scale_attn = 1.0f / sqrtf((float)head_dim);
-    const uint32_t heads_per_kv = n_head / n_kv_head;
-    for (uint32_t h = 0; h < n_head; h++) {
-        const uint32_t kh = h / heads_per_kv;
-        const float *qh = m->qkv + h * (2 * head_dim);
-        float *gate_h = m->qkv + h * (2 * head_dim) + head_dim;
-        float *out_h = m->attn_out + h * head_dim;
-
-        for (uint32_t t = 0; t <= pos; t++) {
-            const float *kt = L->kv_k + (size_t)t * (n_kv_head * head_dim) + kh * head_dim;
-            __m256 acc = _mm256_setzero_ps();
-            for (uint32_t i = 0; i < head_dim; i += 8) {
-                acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i), _mm256_loadu_ps(kt + i), acc);
-            }
-            m->scores[t] = hsum256(acc) * scale_attn;
-        }
-
-        softmax_inplace(m->scores, pos + 1);
-
-        memset(out_h, 0, head_dim * sizeof(float));
-        for (uint32_t t = 0; t <= pos; t++) {
-            const float st = m->scores[t];
-            const float *vt = L->kv_v + (size_t)t * (n_kv_head * head_dim) + kh * head_dim;
-            __m256 vst = _mm256_set1_ps(st);
-            for (uint32_t i = 0; i < head_dim; i += 8) {
-                __m256 vout = _mm256_loadu_ps(out_h + i);
-                __m256 vval = _mm256_loadu_ps(vt + i);
-                _mm256_storeu_ps(out_h + i, _mm256_fmadd_ps(vst, vval, vout));
-            }
-        }
-
-        sigmoid_inplace(gate_h, head_dim);
-        for (uint32_t i = 0; i < head_dim; i += 8) {
-            __m256 vo = _mm256_loadu_ps(out_h + i);
-            __m256 vg = _mm256_loadu_ps(gate_h + i);
-            _mm256_storeu_ps(out_h + i, _mm256_mul_ps(vo, vg));
-        }
-    }
+    /* Boucle par tete parallelisee : scores -> softmax -> V -> gating */
+    attn_heads_run(m, L, pool, m->qkv, 2 * (uint64_t)n_head * head_dim,
+                   m->attn_out, n_head * head_dim, pos, 1);
 
     gemv(pool, L->attn_out, m->attn_out, m->xb);
     for (uint32_t i = 0; i < n_embd; i += 8) {
@@ -741,48 +789,9 @@ static void attention_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool
             apply_rope(L->kv_k + (size_t)(pos + b) * kvrow + kh * head_dim, pos + b, m);
     }
 
-    const float scale_attn = 1.0f / sqrtf((float)head_dim);
-    const uint32_t heads_per_kv = n_head / n_kv_head;
-    for (uint32_t h = 0; h < n_head; h++) {
-        const uint32_t kh = h / heads_per_kv;
-
-        for (uint32_t b = 0; b < B; b++) {
-            const float *qh = m->bqkv + b * stride + h * (2 * head_dim);
-            float *gate_h = m->bqkv + b * stride + h * (2 * head_dim) + head_dim;
-            float *out_h = m->battn_out + b * (n_head * head_dim) + h * head_dim;
-            const uint32_t pl = pos + b;
-
-            for (uint32_t t = 0; t <= pl; t++) {
-                const float *kt = L->kv_k + (size_t)t * kvrow + kh * head_dim;
-                __m256 acc = _mm256_setzero_ps();
-                for (uint32_t i = 0; i < head_dim; i += 8) {
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i), _mm256_loadu_ps(kt + i), acc);
-                }
-                m->scores[t] = hsum256(acc) * scale_attn;
-            }
-
-            softmax_inplace(m->scores, pl + 1);
-
-            memset(out_h, 0, head_dim * sizeof(float));
-            for (uint32_t t = 0; t <= pl; t++) {
-                const float st = m->scores[t];
-                const float *vt = L->kv_v + (size_t)t * kvrow + kh * head_dim;
-                __m256 vst = _mm256_set1_ps(st);
-                for (uint32_t i = 0; i < head_dim; i += 8) {
-                    __m256 vout = _mm256_loadu_ps(out_h + i);
-                    __m256 vval = _mm256_loadu_ps(vt + i);
-                    _mm256_storeu_ps(out_h + i, _mm256_fmadd_ps(vst, vval, vout));
-                }
-            }
-
-            sigmoid_inplace(gate_h, head_dim);
-            for (uint32_t i = 0; i < head_dim; i += 8) {
-                __m256 vo = _mm256_loadu_ps(out_h + i);
-                __m256 vg = _mm256_loadu_ps(gate_h + i);
-                _mm256_storeu_ps(out_h + i, _mm256_mul_ps(vo, vg));
-            }
-        }
-    }
+    /* Boucle par tete parallelisee : scores -> softmax -> V -> gating */
+    attn_heads_run(m, L, pool, m->bqkv, stride, m->battn_out,
+                   n_head * head_dim, pos, B);
 
     gemv_batch(pool, L->attn_out, m->battn_out, n_head * head_dim, B, m->bxb, n_embd);
     for (uint32_t b = 0; b < B; b++)
