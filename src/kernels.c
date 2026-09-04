@@ -796,22 +796,51 @@ void softplus_inplace(float *x, uint64_t n) {
     }
 }
 
-/* softmax : soustraire le max d'abord ! */
+/* softmax : soustraire le max d'abord !
+ * Passe AVX2 complete : max horizontal, exp256_ps polynomial, somme par
+ * lanes en float (precision ~1e-6 relative, valides par test_ops a 1e-4). */
+static inline float hmax256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 m = _mm_max_ps(lo, hi);
+    __m128 s = _mm_movehdup_ps(m);
+    m = _mm_max_ps(m, s);
+    s = _mm_movehl_ps(s, m);
+    m = _mm_max_ps(m, s);
+    return _mm_cvtss_f32(m);
+}
+
 void softmax_inplace(float *x, uint64_t n) {
     if (n == 0) return;
+
     float max_val = x[0];
-    for (uint64_t i = 1; i < n; i++) {
+    __m256 vmax = _mm256_set1_ps(max_val);
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(x + i));
+    max_val = hmax256(vmax);
+    for (; i < n; i++) {
         if (x[i] > max_val) max_val = x[i];
     }
-    double sum_exp = 0.0;
-    for (uint64_t i = 0; i < n; i++) {
+
+    __m256 vm = _mm256_set1_ps(max_val);
+    __m256 vsum = _mm256_setzero_ps();
+    i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 e = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), vm));
+        _mm256_storeu_ps(x + i, e);
+        vsum = _mm256_add_ps(vsum, e);
+    }
+    double sum_exp = (double)hsum256(vsum);
+    for (; i < n; i++) {
         float e = expf(x[i] - max_val);
         x[i] = e;
         sum_exp += (double)e;
     }
+
     float inv_sum = (float)(1.0 / sum_exp);
-    uint64_t i = 0;
     __m256 vinv = _mm256_set1_ps(inv_sum);
+    i = 0;
     for (; i + 8 <= n; i += 8) {
         __m256 vx = _mm256_loadu_ps(x + i);
         _mm256_storeu_ps(x + i, _mm256_mul_ps(vx, vinv));
