@@ -23,6 +23,16 @@ void gemv_batch(pool_t *pool, const gguf_tensor_info_t *W,
                 const float *x, uint64_t ldx, int n,
                 float *out, uint64_t ldo);
 
+/* Fused multi-matrix GEMV: several weight matrices sharing the SAME input
+ * vector x (e.g. q/k/v, ffn gate/up, wqkv/gate/beta/alpha) computed with a
+ * single pool dispatch -> one barrier pair instead of one per matrix.
+ * n_mat <= 8; results are bit-identical to separate gemv/gemv_batch calls. */
+void gemv_multi(pool_t *pool, const gguf_tensor_info_t *const *Ws,
+                const float *x, float *const *outs, int n_mat);
+void gemv_multi_batch(pool_t *pool, const gguf_tensor_info_t *const *Ws,
+                      const float *x, uint64_t ldx, int n,
+                      float *const *outs, const uint64_t *ldos, int n_mat);
+
 /* Ops */
 void rmsnorm(float *out, const float *x, const float *weight, uint64_t n, float eps);
 void l2norm(float *out, const float *x, uint64_t n, float eps);

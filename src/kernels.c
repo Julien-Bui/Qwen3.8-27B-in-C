@@ -647,6 +647,94 @@ void gemv_batch(pool_t *pool, const gguf_tensor_info_t *W,
         gemv_batch_chunk(&job, 0, 1);
 }
 
+/* ==================== GEMV multi-matrices fusionnées ====================
+ * Plusieurs matrices partagent la même entrée x (q/k/v, gate/up,
+ * wqkv/gate/beta/alpha) : un seul dispatch pool pour toutes -> une seule
+ * paire de barrières au lieu d'une par matrice. Partitionnement sur
+ * l'ensemble des lignes (mêmes largeurs -> équilibre de charge conservé).
+ * Chaque ligne reste calculée entière par un seul thread -> bit-exact. */
+
+#define GEMV_MULTI_MAX 8
+
+typedef struct {
+    int n_mat;
+    const gguf_tensor_info_t *Ws[GEMV_MULTI_MAX];
+    const float *x;
+    float *outs[GEMV_MULTI_MAX];
+} gemv_multi_job_t;
+
+static void gemv_multi_chunk(void *arg, int tid, int ntid) {
+    gemv_multi_job_t *j = arg;
+    uint64_t total = 0;
+    for (int k = 0; k < j->n_mat; k++) total += j->Ws[k]->ne[1];
+    const uint64_t g0 = total * (uint64_t)tid / ntid;
+    const uint64_t g1 = total * (uint64_t)(tid + 1) / ntid;
+    uint64_t acc = 0;
+    for (int k = 0; k < j->n_mat && g1 > acc; k++) {
+        const uint64_t rows = j->Ws[k]->ne[1];
+        const uint64_t r0 = (g0 > acc) ? g0 - acc : 0;
+        const uint64_t r1 = (g1 - acc < rows) ? g1 - acc : rows;
+        if (r1 > r0)
+            gemv_rows(j->Ws[k], j->x, j->outs[k], r0, r1);
+        acc += rows;
+    }
+}
+
+void gemv_multi(pool_t *pool, const gguf_tensor_info_t *const *Ws,
+                const float *x, float *const *outs, int n_mat) {
+    gemv_multi_job_t job = {0};
+    job.n_mat = n_mat;
+    job.x = x;
+    for (int k = 0; k < n_mat; k++) { job.Ws[k] = Ws[k]; job.outs[k] = outs[k]; }
+    if (pool)
+        pool_run(pool, gemv_multi_chunk, &job);
+    else
+        gemv_multi_chunk(&job, 0, 1);
+}
+
+typedef struct {
+    int n_mat;
+    const gguf_tensor_info_t *Ws[GEMV_MULTI_MAX];
+    const float *x;
+    uint64_t ldx;
+    int n;
+    float *outs[GEMV_MULTI_MAX];
+    uint64_t ldos[GEMV_MULTI_MAX];
+} gemv_multi_b_job_t;
+
+static void gemv_multi_b_chunk(void *arg, int tid, int ntid) {
+    gemv_multi_b_job_t *j = arg;
+    uint64_t total = 0;
+    for (int k = 0; k < j->n_mat; k++) total += j->Ws[k]->ne[1];
+    const uint64_t g0 = total * (uint64_t)tid / ntid;
+    const uint64_t g1 = total * (uint64_t)(tid + 1) / ntid;
+    uint64_t acc = 0;
+    for (int k = 0; k < j->n_mat && g1 > acc; k++) {
+        const uint64_t rows = j->Ws[k]->ne[1];
+        const uint64_t r0 = (g0 > acc) ? g0 - acc : 0;
+        const uint64_t r1 = (g1 - acc < rows) ? g1 - acc : rows;
+        if (r1 > r0)
+            gemv_rows_batch(j->Ws[k], j->x, j->ldx, j->n,
+                            j->outs[k], j->ldos[k], r0, r1);
+        acc += rows;
+    }
+}
+
+void gemv_multi_batch(pool_t *pool, const gguf_tensor_info_t *const *Ws,
+                      const float *x, uint64_t ldx, int n,
+                      float *const *outs, const uint64_t *ldos, int n_mat) {
+    gemv_multi_b_job_t job = {0};
+    job.n_mat = n_mat;
+    job.x = x; job.ldx = ldx; job.n = n;
+    for (int k = 0; k < n_mat; k++) {
+        job.Ws[k] = Ws[k]; job.outs[k] = outs[k]; job.ldos[k] = ldos[k];
+    }
+    if (pool)
+        pool_run(pool, gemv_multi_b_chunk, &job);
+    else
+        gemv_multi_b_chunk(&job, 0, 1);
+}
+
 /* ======================== Module D1 : Ops ======================== */
 
 /* RMSNorm : out = (x / sqrt(mean(x2) + eps)) * weight */
