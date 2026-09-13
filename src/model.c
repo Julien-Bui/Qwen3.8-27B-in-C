@@ -425,9 +425,13 @@ void attention_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t po
     const uint32_t n_ff = d->n_ff;
 
     rmsnorm(m->xb, m->x, (const float *)L->attn_norm->data, n_embd, eps);
-    gemv(pool, L->attn_q, m->xb, m->qkv);
-    gemv(pool, L->attn_k, m->xb, m->kv_small);
-    gemv(pool, L->attn_v, m->xb, m->kv_small + n_kv_head * head_dim);
+
+    /* 3 GEMV partageant xb : un seul dispatch pool */
+    {
+        const gguf_tensor_info_t *Ws[3] = { L->attn_q, L->attn_k, L->attn_v };
+        float *outs[3] = { m->qkv, m->kv_small, m->kv_small + n_kv_head * head_dim };
+        gemv_multi(pool, Ws, m->xb, outs, 3);
+    }
 
     const float *q_norm_w = (const float *)L->attn_q_norm->data;
     const float *k_norm_w = (const float *)L->attn_k_norm->data;
@@ -465,9 +469,12 @@ void attention_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool, uint32_t po
 
     rmsnorm(m->xb, m->x, (const float *)L->post_attn_norm->data, n_embd, eps);
 
-    gemv(pool, L->ffn_gate, m->xb, m->ffn_buf);
+    {
+        const gguf_tensor_info_t *Ws[2] = { L->ffn_gate, L->ffn_up };
+        float *outs[2] = { m->ffn_buf, m->qkv };
+        gemv_multi(pool, Ws, m->xb, outs, 2);
+    }
     silu_inplace(m->ffn_buf, n_ff);
-    gemv(pool, L->ffn_up, m->xb, m->qkv);
     for (uint32_t i = 0; i < n_ff; i += 8) {
         _mm256_storeu_ps(m->ffn_buf + i, _mm256_mul_ps(_mm256_loadu_ps(m->ffn_buf + i), _mm256_loadu_ps(m->qkv + i)));
     }
@@ -620,7 +627,14 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
     const uint32_t n_ff = d->n_ff;
 
     rmsnorm(m->xb, m->x, (const float *)L->attn_norm->data, n_embd, eps);
-    gemv(pool, L->wqkv, m->xb, m->qkv);
+
+    /* 4 GEMV partageant xb : un seul dispatch pool (1 paire de barrières) */
+    float beta[256], alpha[256];   /* bornes validees a l'init */
+    {
+        const gguf_tensor_info_t *Ws[4] = { L->wqkv, L->wqkv_gate, L->ssm_beta, L->ssm_alpha };
+        float *outs[4] = { m->qkv, m->z, beta, alpha };
+        gemv_multi(pool, Ws, m->xb, outs, 4);
+    }
 
     const float *conv_w = (const float *)L->ssm_conv1d->data;
     for (uint32_t c = 0; c < conv_dim; c++) {
@@ -641,12 +655,6 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
         l2norm(Q + kh * head_k_dim, Q + kh * head_k_dim, head_k_dim, eps);
         l2norm(K + kh * head_k_dim, K + kh * head_k_dim, head_k_dim, eps);
     }
-
-    gemv(pool, L->wqkv_gate, m->xb, m->z);
-
-    float beta[256], alpha[256];   /* bornes validees a l'init */
-    gemv(pool, L->ssm_beta, m->xb, beta);
-    gemv(pool, L->ssm_alpha, m->xb, alpha);
 
     /* Recurrence SSM parallelisee sur les tetes v (etats independants) */
     gdn_ssm_run(m, L, pool, m->qkv, conv_dim, beta, alpha,
@@ -671,9 +679,12 @@ void gdn_layer(qwen_model_t *m, qwen_layer_t *L, pool_t *pool) {
 
     rmsnorm(m->xb, m->x, (const float *)L->post_attn_norm->data, n_embd, eps);
 
-    gemv(pool, L->ffn_gate, m->xb, m->ffn_buf);
+    {
+        const gguf_tensor_info_t *Ws[2] = { L->ffn_gate, L->ffn_up };
+        float *outs[2] = { m->ffn_buf, m->qkv };
+        gemv_multi(pool, Ws, m->xb, outs, 2);
+    }
     silu_inplace(m->ffn_buf, n_ff);
-    gemv(pool, L->ffn_up, m->xb, m->qkv);
     for (uint32_t i = 0; i < n_ff; i += 8) {
         _mm256_storeu_ps(m->ffn_buf + i, _mm256_mul_ps(_mm256_loadu_ps(m->ffn_buf + i), _mm256_loadu_ps(m->qkv + i)));
     }
@@ -761,9 +772,14 @@ static void attention_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool
     for (uint32_t b = 0; b < B; b++)
         rmsnorm(m->bxb + b * n_embd, m->bx + b * n_embd,
                 (const float *)L->attn_norm->data, n_embd, eps);
-    gemv_batch(pool, L->attn_q, m->bxb, n_embd, B, m->bqkv, stride);
-    gemv_batch(pool, L->attn_k, m->bxb, n_embd, B, m->bkv, 2 * kvrow);
-    gemv_batch(pool, L->attn_v, m->bxb, n_embd, B, m->bkv + kvrow, 2 * kvrow);
+
+    /* 3 GEMV batch partageant bxb : un seul dispatch pool */
+    {
+        const gguf_tensor_info_t *Ws[3] = { L->attn_q, L->attn_k, L->attn_v };
+        float *outs[3] = { m->bqkv, m->bkv, m->bkv + kvrow };
+        const uint64_t ldos[3] = { stride, 2 * kvrow, 2 * kvrow };
+        gemv_multi_batch(pool, Ws, m->bxb, n_embd, B, outs, ldos, 3);
+    }
 
     const float *q_norm_w = (const float *)L->attn_q_norm->data;
     const float *k_norm_w = (const float *)L->attn_k_norm->data;
@@ -804,10 +820,15 @@ static void attention_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool
         rmsnorm(m->bxb + b * n_embd, m->bx + b * n_embd,
                 (const float *)L->post_attn_norm->data, n_embd, eps);
 
-    gemv_batch(pool, L->ffn_gate, m->bxb, n_embd, B, m->bffn, n_ff);
+    /* 2 GEMV batch partageant bxb : un seul dispatch pool */
+    {
+        const gguf_tensor_info_t *Ws[2] = { L->ffn_gate, L->ffn_up };
+        float *outs[2] = { m->bffn, m->bqkv };
+        const uint64_t ldos[2] = { n_ff, stride };
+        gemv_multi_batch(pool, Ws, m->bxb, n_embd, B, outs, ldos, 2);
+    }
     for (uint32_t b = 0; b < B; b++)
         silu_inplace(m->bffn + b * n_ff, n_ff);
-    gemv_batch(pool, L->ffn_up, m->bxb, n_embd, B, m->bqkv, stride);
     for (uint32_t b = 0; b < B; b++)
         for (uint32_t i = 0; i < n_ff; i += 8)
             _mm256_storeu_ps(m->bffn + b * n_ff + i,
@@ -838,7 +859,15 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
     for (uint32_t b = 0; b < B; b++)
         rmsnorm(m->bxb + b * n_embd, m->bx + b * n_embd,
                 (const float *)L->attn_norm->data, n_embd, eps);
-    gemv_batch(pool, L->wqkv, m->bxb, n_embd, B, m->bqkv, stride);
+
+    /* 4 GEMV batch partageant bxb : un seul dispatch pool */
+    float beta_b[PREFILL_MAX_B][256], alpha_b[PREFILL_MAX_B][256];
+    {
+        const gguf_tensor_info_t *Ws[4] = { L->wqkv, L->wqkv_gate, L->ssm_beta, L->ssm_alpha };
+        float *outs[4] = { m->bqkv, m->bz, &beta_b[0][0], &alpha_b[0][0] };
+        const uint64_t ldos[4] = { stride, d_inner, 256, 256 };
+        gemv_multi_batch(pool, Ws, m->bxb, n_embd, B, outs, ldos, 4);
+    }
 
     /* conv1d causale : sequentielle sur le batch (l'etat glisse).
      * Checkpoint conv uniquement en mode verification speculative (le
@@ -888,12 +917,6 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
         }
     }
 
-    gemv_batch(pool, L->wqkv_gate, m->bxb, n_embd, B, m->bz, d_inner);
-
-    float beta_b[PREFILL_MAX_B][256], alpha_b[PREFILL_MAX_B][256];
-    gemv_batch(pool, L->ssm_beta, m->bxb, n_embd, B, &beta_b[0][0], 256);
-    gemv_batch(pool, L->ssm_alpha, m->bxb, n_embd, B, &alpha_b[0][0], 256);
-
     /* Recurrence SSM parallelisee : chaque thread possede une tranche de
      * tetes v et deroule les B tokens sequentiellement (une seule barriere
      * par couche, etats S chauds en cache). Checkpoints : chaque thread
@@ -928,10 +951,15 @@ static void gdn_layer_batch(qwen_model_t *m, qwen_layer_t *L, pool_t *pool,
         rmsnorm(m->bxb + b * n_embd, m->bx + b * n_embd,
                 (const float *)L->post_attn_norm->data, n_embd, eps);
 
-    gemv_batch(pool, L->ffn_gate, m->bxb, n_embd, B, m->bffn, n_ff);
+    /* 2 GEMV batch partageant bxb : un seul dispatch pool */
+    {
+        const gguf_tensor_info_t *Ws[2] = { L->ffn_gate, L->ffn_up };
+        float *outs[2] = { m->bffn, m->bqkv };
+        const uint64_t ldos[2] = { n_ff, stride };
+        gemv_multi_batch(pool, Ws, m->bxb, n_embd, B, outs, ldos, 2);
+    }
     for (uint32_t b = 0; b < B; b++)
         silu_inplace(m->bffn + b * n_ff, n_ff);
-    gemv_batch(pool, L->ffn_up, m->bxb, n_embd, B, m->bqkv, stride);
     for (uint32_t b = 0; b < B; b++)
         for (uint32_t i = 0; i < n_ff; i += 8)
             _mm256_storeu_ps(m->bffn + b * n_ff + i,
